@@ -2194,8 +2194,15 @@ class GitPushDialog(QDialog):
         pat_row.addWidget(self._pat)
         pat_row.addWidget(pat_help)
 
+        self._branch = QComboBox()
+        self._branch.addItems(["main", "windows", "roboapps"])
+        saved_branch = creds.get("branch", "main")
+        idx = self._branch.findText(saved_branch)
+        self._branch.setCurrentIndex(idx if idx >= 0 else 0)
+
         form.addRow("Commit Message:", self._msg)
         form.addRow("GitHub Repository:", self._repo_url)
+        form.addRow("Branch:", self._branch)
         form.addRow("Personal Access Token:", pat_row)
         layout.addLayout(form)
 
@@ -2230,6 +2237,7 @@ class GitPushDialog(QDialog):
         self._result = {
             "message":  self._msg.text().strip() or f"TestDrive update {time.strftime('%Y-%m-%d %H:%M')}",
             "repo_url": self._repo_url.text().strip(),
+            "branch":   self._branch.currentText(),
             "token":    self._pat.text().strip(),
             "save":     self._save_cb.isChecked(),
         }
@@ -5978,16 +5986,18 @@ class RobotControlApp(QMainWindow):
             # Extract username/repo_name from URL for future pre-fill
             m = re.match(r'https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$',
                          data["repo_url"])
-            update = {"token": data["token"]}
+            update = {"token": data["token"], "branch": data["branch"]}
             if m:
                 update["username"] = m.group(1)
                 update["repo_name"] = m.group(2)
             self._save_git_creds(update)
 
         errors = []
+        branch = data.get("branch", "main")
 
         self._log("--- Git Commit & Push ---")
         self._log(f"Repository: {data['repo_url']}")
+        self._log(f"Branch: {branch}")
         self._log(f"Commit message: {data['message']}")
 
         # Ensure remote is set with auth token
@@ -6022,9 +6032,9 @@ class RobotControlApp(QMainWindow):
         else:
             self._log("git commit: OK")
 
-        self._log("Running: git pull --rebase origin HEAD")
+        self._log(f"Running: git pull --rebase origin {branch}")
         r = subprocess.run(
-            ["git", "pull", "--rebase", "origin", "HEAD"],
+            ["git", "pull", "--rebase", "origin", branch],
             cwd=_PKG_DIR, capture_output=True, text=True)
         if r.stdout.strip():
             self._log(r.stdout.strip())
@@ -6036,9 +6046,9 @@ class RobotControlApp(QMainWindow):
         else:
             self._log("git pull --rebase: OK")
 
-        self._log("Running: git push -u origin HEAD")
+        self._log(f"Running: git push -u origin HEAD:{branch}")
         r = subprocess.run(
-            ["git", "push", "-u", "origin", "HEAD"],
+            ["git", "push", "-u", "origin", f"HEAD:{branch}"],
             cwd=_PKG_DIR, capture_output=True, text=True)
         if r.stdout.strip():
             self._log(r.stdout.strip())
