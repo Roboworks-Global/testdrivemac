@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "next_id": 59,
+  "packages": {
+    "movement_pkg": {
+      "label": "movement",
+      "color": "#34C759"
+    },
+    "robot": {
+      "label": "robot",
+      "color": "#34C759"
+    }
+  },
+  "items": [
+    {
+      "item_id": "node_1",
+      "item_type": "node",
+      "name": "movement",
+      "x": 399.9140625,
+      "y": 240.87890625,
+      "package": "movement_pkg",
+      "width": 120,
+      "height": 60
+    },
+    {
+      "item_id": "topic_2",
+      "item_type": "topic",
+      "name": "/cmd_vel",
+      "x": 112.0,
+      "y": 137.0,
+      "package": "movement_pkg",
+      "width": 140,
+      "height": 40
+    },
+    {
+      "item_id": "topic_3",
+      "item_type": "topic",
+      "name": "/scan",
+      "x": 714.8359375,
+      "y": 160.93359375,
+      "package": "movement_pkg",
+      "width": 140,
+      "height": 40
+    },
+    {
+      "item_id": "node_17",
+      "item_type": "node",
+      "name": "mic",
+      "x": 186.0390625,
+      "y": 471.16796875,
+      "package": "Arm",
+      "width": 64,
+      "height": 64,
+      "hidden": true
+    },
+    {
+      "item_id": "topic_22",
+      "item_type": "topic",
+      "name": "/speak",
+      "x": 400,
+      "y": 300,
+      "package": "Arm",
+      "width": 140,
+      "height": 40,
+      "hidden": true
+    },
+    {
+      "item_id": "topic_30",
+      "item_type": "topic",
+      "name": "/parameter_events",
+      "x": 740.0,
+      "y": 243.0,
+      "package": "robot",
+      "width": 140,
+      "height": 40,
+      "hidden": true
+    },
+    {
+      "item_id": "topic_31",
+      "item_type": "topic",
+      "name": "/rosout",
+      "x": 716.671875,
+      "y": 262.23046875,
+      "package": "robot",
+      "width": 140,
+      "height": 40,
+      "hidden": true
+    },
+    {
+      "item_id": "node_50",
+      "item_type": "node",
+      "name": "My Node",
+      "x": 400,
+      "y": 200,
+      "package": "test",
+      "width": 64,
+      "height": 64
+    }
+  ],
+  "connections": [
+    {
+      "conn_id": "conn_2",
+      "source_id": "topic_3",
+      "target_id": "node_1",
+      "conn_type": "subscribes"
+    },
+    {
+      "conn_id": "conn_19",
+      "source_id": "node_1",
+      "target_id": "topic_2",
+      "conn_type": "publishes"
+    }
+  ]
+}

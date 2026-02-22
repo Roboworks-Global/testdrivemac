@@ -1,0 +1,20 @@
+[
+  {
+    "ip": "192.168.1.177",
+    "username": "wheeltec",
+    "password": "dongguan",
+    "name": "Home"
+  },
+  {
+    "ip": "10.0.0.8",
+    "username": "wheeltec",
+    "password": "dongguan",
+    "name": "Charming"
+  },
+  {
+    "ip": "192.168.1.153",
+    "username": "wheeltec",
+    "password": "dongguan",
+    "name": "Home Ethernet"
+  }
+]
