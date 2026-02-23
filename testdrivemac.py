@@ -33,6 +33,7 @@ from PyQt6.QtGui import (
     QPen, QBrush, QPolygonF, QTextCursor, QPainterPath, QPixmap, QIcon,
 )
 
+import socket
 import paramiko
 
 # --- Configuration ---
@@ -5082,13 +5083,12 @@ class RobotControlApp(QMainWindow):
         if not ip:
             return
         profiles = self._load_profiles()
-        for p in profiles:
-            if p["ip"] == ip:
-                p["username"] = username
-                p["password"] = password
-                break
-        else:
-            profiles.append({"ip": ip, "username": username, "password": password})
+        # Remove existing entry for this IP (if any) so we can append it at the end
+        # (end of list = most recently used, auto-selected on next launch)
+        existing = next((p for p in profiles if p["ip"] == ip), None)
+        profiles = [p for p in profiles if p["ip"] != ip]
+        name = existing.get("name", "") if existing else ""
+        profiles.append({"ip": ip, "username": username, "password": password, "name": name})
         self._save_profiles(profiles)
         self._refresh_profile_combo()
 
@@ -5532,14 +5532,28 @@ class RobotControlApp(QMainWindow):
             "(from the project directory)"
         )
 
-    def _generate_fastdds_xml(self, robot_ip):
+    def _get_local_ip_for(self, remote_ip):
+        """Return the Mac's local IP address used to reach remote_ip (picks the right interface)."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((remote_ip, 1))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return None
+
+    def _generate_fastdds_xml(self, robot_ip, mac_ip=None):
         """Generate FastDDS XML config with unicast initial peers for all robot participants.
 
         In ROS2/FastDDS each node is a separate DDS participant listening on its own
         metatraffic port: 7410 + 2*k  (domain 0, participant k).
-        Enumerating ports 7410-7440 covers up to 16 nodes on the robot so that
+        Enumerating ports 7410-7472 covers up to 32 nodes on the robot so that
         every node (ekf, motor driver, robot_state_publisher, etc.) is discovered
         and its VOLATILE topics (/tf, /odom, /scan ...) actually flow to the Mac.
+
+        mac_ip — if provided, pins FastDDS to that local interface so it never
+        accidentally binds to loopback or a VPN adapter instead of the WiFi NIC.
         """
         locators = "\n".join(
             f"          <locator><udpv4>"
@@ -5548,11 +5562,25 @@ class RobotControlApp(QMainWindow):
             f"</udpv4></locator>"
             for k in range(32)  # covers participants 0-31 (ports 7410-7472)
         )
+
+        # If we know the Mac's local IP, pin the participant to that interface.
+        interface_block = ""
+        if mac_ip:
+            interface_block = f"""\
+      <defaultUnicastLocatorList>
+        <locator><udpv4><address>{mac_ip}</address></udpv4></locator>
+      </defaultUnicastLocatorList>
+      <metatrafficUnicastLocatorList>
+        <locator><udpv4><address>{mac_ip}</address></udpv4></locator>
+      </metatrafficUnicastLocatorList>
+"""
+
         xml_content = f"""\
 <?xml version="1.0" encoding="UTF-8"?>
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
   <participant profile_name="participant_profile" is_default_profile="true">
     <rtps>
+{interface_block}\
       <builtin>
         <initialPeersList>
 {locators}
@@ -5642,30 +5670,37 @@ class RobotControlApp(QMainWindow):
         if robot_ip == "127.0.0.1":
             # Local Gazebo: use CycloneDDS with default multicast on loopback
             env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+            self._log("  DDS: CycloneDDS (local Gazebo)")
         else:
             # Real robot: use FastDDS (ROS2 Humble default on most robots)
-            # Add unicast initial peer so discovery works reliably over WiFi
+            # Detect the Mac's local IP for this robot's subnet so FastDDS
+            # binds to the right network interface (WiFi), not loopback or VPN.
+            mac_ip = self._get_local_ip_for(robot_ip)
             env["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
             env.pop("CYCLONEDDS_URI", None)
-            fastdds_xml = self._generate_fastdds_xml(robot_ip)
+            fastdds_xml = self._generate_fastdds_xml(robot_ip, mac_ip)
             # Set both old and new variable names (FastDDS 2.x vs 3.x)
             env["FASTRTPS_DEFAULT_PROFILES_FILE"] = fastdds_xml
             env["FASTDDS_DEFAULT_PROFILES_FILE"] = fastdds_xml
+            self._log(f"  DDS: FastDDS  robot={robot_ip}  mac={mac_ip or 'unknown'}")
 
         # Build command
         rviz_config = os.path.join(_PKG_DIR, "default_view.rviz")
         rviz_exe = os.path.join(conda_bin, "rviz2")
         cmd = [rviz_exe, "-d", rviz_config]
 
+        rviz_log = os.path.join(_PKG_DIR, ".rviz2.log")
         self._log(f"Launching RViz2 ({'local Gazebo' if robot_ip == '127.0.0.1' else robot_ip})...")
         self._log(f"  conda env: {conda_prefix}")
+        self._log(f"  RViz2 log:  {rviz_log}")
 
         try:
+            rviz_log_fh = open(rviz_log, "w")
             self._rviz_process = subprocess.Popen(
                 cmd,
                 env=env,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=rviz_log_fh,
                 start_new_session=True,
             )
             self._log(f"  RViz2 started (PID {self._rviz_process.pid}).")
