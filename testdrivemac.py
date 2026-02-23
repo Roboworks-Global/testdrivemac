@@ -5609,6 +5609,37 @@ class RobotControlApp(QMainWindow):
             f.write(xml_content)
         return xml_path
 
+    def _setup_ament_package_for_rviz(self, env):
+        """Create a minimal ament index entry so RViz resolves package://movement_pkg/meshes/*.
+
+        The robot's URDF references meshes as package://movement_pkg/meshes/...
+        RViz2 uses ament_index_cpp to look them up.  We create a fake ament
+        prefix under _PKG_DIR/.ament_index/ with the required marker file and
+        a symlink to the real meshes directory, then prepend it to AMENT_PREFIX_PATH.
+        """
+        ament_root = os.path.join(_PKG_DIR, ".ament_index")
+        pkg_share   = os.path.join(ament_root, "share", "movement_pkg")
+        index_dir   = os.path.join(ament_root, "share", "ament_index",
+                                   "resource_index", "packages")
+        meshes_dst  = os.path.join(pkg_share, "meshes")
+        meshes_src  = os.path.join(_PKG_DIR, "meshes")
+
+        os.makedirs(pkg_share,  exist_ok=True)
+        os.makedirs(index_dir,  exist_ok=True)
+
+        # Marker file telling ament this package exists
+        marker = os.path.join(index_dir, "movement_pkg")
+        if not os.path.isfile(marker):
+            open(marker, "w").close()
+
+        # Symlink meshes/ so package://movement_pkg/meshes/x.STL resolves
+        if not os.path.exists(meshes_dst) and os.path.isdir(meshes_src):
+            os.symlink(meshes_src, meshes_dst)
+
+        existing = env.get("AMENT_PREFIX_PATH", "")
+        if ament_root not in existing:
+            env["AMENT_PREFIX_PATH"] = (ament_root + ":" + existing).rstrip(":")
+
     def _launch_rviz(self):
         """Launch RViz2 in a separate window via the conda ros_env environment."""
         # Guard against double-launch
@@ -5702,6 +5733,10 @@ class RobotControlApp(QMainWindow):
             # UDPv4 transport avoids shared-memory issues on macOS (FastDDS 3.x)
             env["FASTDDS_BUILTIN_TRANSPORTS"] = "UDPv4"
             self._log(f"  DDS: FastDDS (matched robot)  robot={robot_ip}  mac={mac_ip or 'unknown'}  domain={robot_domain}")
+
+        # Register movement_pkg as a fake ament package so RViz can resolve
+        # package://movement_pkg/meshes/*.STL → _PKG_DIR/meshes/*.STL
+        self._setup_ament_package_for_rviz(env)
 
         # Build command
         rviz_config = os.path.join(_PKG_DIR, "default_view.rviz")
