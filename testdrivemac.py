@@ -6066,7 +6066,7 @@ class RobotControlApp(QMainWindow):
         else:
             self._log("--- Push complete ---")
             QMessageBox.information(self, "Git — Push Complete",
-                                    f"Changes pushed to:\n{data['repo_url']}")
+                                    f"Successful push to:\n{data['repo_url']}  [{branch}]")
 
     # --- git pull ---
 
@@ -6101,8 +6101,15 @@ class RobotControlApp(QMainWindow):
         if r.returncode != 0:
             QMessageBox.warning(self, "Git — Pull Failed", r.stderr.strip())
         else:
-            msg = r.stdout.strip() or "Already up to date."
-            QMessageBox.information(self, "Git — Pull Complete", msg)
+            remote_url = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=_PKG_DIR, capture_output=True, text=True).stdout.strip()
+            clean_url = re.sub(r'https://[^@]+@', 'https://', remote_url)
+            branch = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=_PKG_DIR, capture_output=True, text=True).stdout.strip()
+            QMessageBox.information(self, "Git — Pull Complete",
+                                    f"Successful pull from:\n{clean_url}  [{branch}]")
 
 
 def main():
