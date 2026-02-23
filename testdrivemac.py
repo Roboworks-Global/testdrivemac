@@ -5548,12 +5548,12 @@ class RobotControlApp(QMainWindow):
 
         In ROS2/FastDDS each node is a separate DDS participant listening on its own
         metatraffic port: 7410 + 2*k  (domain 0, participant k).
-        Enumerating ports 7410-7472 covers up to 32 nodes on the robot so that
-        every node (ekf, motor driver, robot_state_publisher, etc.) is discovered
-        and its VOLATILE topics (/tf, /odom, /scan ...) actually flow to the Mac.
+        Enumerating ports 7410-7472 covers up to 32 nodes on the robot.
 
-        mac_ip — if provided, pins FastDDS to that local interface so it never
-        accidentally binds to loopback or a VPN adapter instead of the WiFi NIC.
+        NOTE: defaultUnicastLocatorList / metatrafficUnicastLocatorList are intentionally
+        omitted — specifying them without a port causes FastDDS to use port=0 which
+        silently breaks all data reception.  FastDDS auto-detects the correct local
+        interface via the socket used to reach robot_ip.
         """
         locators = "\n".join(
             f"          <locator><udpv4>"
@@ -5563,24 +5563,11 @@ class RobotControlApp(QMainWindow):
             for k in range(32)  # covers participants 0-31 (ports 7410-7472)
         )
 
-        # If we know the Mac's local IP, pin the participant to that interface.
-        interface_block = ""
-        if mac_ip:
-            interface_block = f"""\
-      <defaultUnicastLocatorList>
-        <locator><udpv4><address>{mac_ip}</address></udpv4></locator>
-      </defaultUnicastLocatorList>
-      <metatrafficUnicastLocatorList>
-        <locator><udpv4><address>{mac_ip}</address></udpv4></locator>
-      </metatrafficUnicastLocatorList>
-"""
-
         xml_content = f"""\
 <?xml version="1.0" encoding="UTF-8"?>
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
   <participant profile_name="participant_profile" is_default_profile="true">
     <rtps>
-{interface_block}\
       <builtin>
         <initialPeersList>
 {locators}
@@ -5705,13 +5692,15 @@ class RobotControlApp(QMainWindow):
             env.pop("FASTDDS_DEFAULT_PROFILES_FILE", None)
             self._log(f"  DDS: CycloneDDS (matched robot)  domain={robot_domain}")
         else:
-            # Robot uses FastDDS — bind to the correct Mac WiFi interface
+            # Robot uses FastDDS — unicast initialPeersList so discovery works over WiFi
             mac_ip = self._get_local_ip_for(robot_ip)
             env["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
             env.pop("CYCLONEDDS_URI", None)
-            fastdds_xml = self._generate_fastdds_xml(robot_ip, mac_ip)
+            fastdds_xml = self._generate_fastdds_xml(robot_ip)
             env["FASTRTPS_DEFAULT_PROFILES_FILE"] = fastdds_xml
             env["FASTDDS_DEFAULT_PROFILES_FILE"] = fastdds_xml
+            # UDPv4 transport avoids shared-memory issues on macOS (FastDDS 3.x)
+            env["FASTDDS_BUILTIN_TRANSPORTS"] = "UDPv4"
             self._log(f"  DDS: FastDDS (matched robot)  robot={robot_ip}  mac={mac_ip or 'unknown'}  domain={robot_domain}")
 
         # Build command
