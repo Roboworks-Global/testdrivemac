@@ -2247,6 +2247,58 @@ class GitPushDialog(QDialog):
         return self._result
 
 
+class GitPullDialog(QDialog):
+    """Dialog: Select branch and pull from GitHub."""
+
+    def __init__(self, creds, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pull from GitHub")
+        self.setMinimumWidth(320)
+        self._result = {}
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(14)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setSpacing(10)
+
+        self._branch = QComboBox()
+        self._branch.addItems(["main", "windows", "roboapps"])
+        saved_branch = creds.get("branch", "main")
+        idx = self._branch.findText(saved_branch)
+        self._branch.setCurrentIndex(idx if idx >= 0 else 0)
+
+        form.addRow("Branch:", self._branch)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setFixedWidth(90)
+        cancel_btn.setStyleSheet(
+            "QPushButton { padding: 8px; border-radius: 8px; border: 1px solid #ccc; }")
+        cancel_btn.clicked.connect(self.reject)
+        pull_btn = QPushButton("Pull")
+        pull_btn.setFixedWidth(90)
+        pull_btn.setStyleSheet(
+            "QPushButton { background-color: #0969DA; color: white; "
+            "padding: 8px; border-radius: 8px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #0757BA; }"
+        )
+        pull_btn.clicked.connect(self._accept)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(pull_btn)
+        layout.addLayout(btn_row)
+
+    def _accept(self):
+        self._result = {"branch": self._branch.currentText()}
+        self.accept()
+
+    def result_data(self):
+        return self._result
+
+
 # --- Main window ---
 
 class RobotControlApp(QMainWindow):
@@ -6083,6 +6135,13 @@ class RobotControlApp(QMainWindow):
                                 "Use 'Initialize & Create GitHub Repo' first.")
             return
 
+        # Show branch selection dialog
+        dlg = GitPullDialog(creds, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        data = dlg.result_data()
+        branch = data["branch"]
+
         # Inject token into remote URL if we have one
         if token:
             r2 = subprocess.run(["git", "remote", "get-url", "origin"],
@@ -6096,7 +6155,7 @@ class RobotControlApp(QMainWindow):
                     subprocess.run(["git", "remote", "set-url", "origin", auth_url],
                                    cwd=_PKG_DIR, capture_output=True)
 
-        r = subprocess.run(["git", "pull"],
+        r = subprocess.run(["git", "pull", "--rebase", "origin", branch],
                            cwd=_PKG_DIR, capture_output=True, text=True)
         if r.returncode != 0:
             QMessageBox.warning(self, "Git — Pull Failed", r.stderr.strip())
@@ -6105,9 +6164,6 @@ class RobotControlApp(QMainWindow):
                 ["git", "remote", "get-url", "origin"],
                 cwd=_PKG_DIR, capture_output=True, text=True).stdout.strip()
             clean_url = re.sub(r'https://[^@]+@', 'https://', remote_url)
-            branch = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=_PKG_DIR, capture_output=True, text=True).stdout.strip()
             QMessageBox.information(self, "Git — Pull Complete",
                                     f"Successful pull from:\n{clean_url}  [{branch}]")
 
