@@ -5664,25 +5664,55 @@ class RobotControlApp(QMainWindow):
         env["LD_LIBRARY_PATH"] = conda_lib + ":" + env.get("LD_LIBRARY_PATH", "")
         env["DYLD_LIBRARY_PATH"] = conda_lib + ":" + env.get("DYLD_LIBRARY_PATH", "")
 
-        # DDS configuration
-        env["ROS_DOMAIN_ID"] = env.get("ROS_DOMAIN_ID", "0")
+        # DDS configuration — detect what the robot actually uses so we match it
         env.pop("ROS_LOCALHOST_ONLY", None)        # never restrict to loopback
+
+        robot_rmw = "rmw_fastrtps_cpp"            # default assumption
+        robot_domain = "0"
+        if robot_ip != "127.0.0.1" and self.ssh_client:
+            try:
+                rmw_cmd = (
+                    ROS_SOURCE_CMD + " && "
+                    "echo \"RMW=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}\" && "
+                    "echo \"DOMAIN=${ROS_DOMAIN_ID:-0}\""
+                )
+                _, stdout, _ = self.ssh_client.exec_command(rmw_cmd, timeout=5)
+                out = stdout.read().decode()
+                for line in out.splitlines():
+                    if line.startswith("RMW="):
+                        v = line.split("=", 1)[1].strip()
+                        if v:
+                            robot_rmw = v
+                    elif line.startswith("DOMAIN="):
+                        v = line.split("=", 1)[1].strip()
+                        if v.isdigit():
+                            robot_domain = v
+            except Exception:
+                pass
+
+        env["ROS_DOMAIN_ID"] = robot_domain
+
         if robot_ip == "127.0.0.1":
             # Local Gazebo: use CycloneDDS with default multicast on loopback
             env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
             self._log("  DDS: CycloneDDS (local Gazebo)")
+        elif "cyclone" in robot_rmw.lower():
+            # Robot uses CycloneDDS — match it with unicast peer config
+            env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+            cyclone_xml = self._generate_cyclonedds_xml(robot_ip)
+            env["CYCLONEDDS_URI"] = cyclone_xml
+            env.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+            env.pop("FASTDDS_DEFAULT_PROFILES_FILE", None)
+            self._log(f"  DDS: CycloneDDS (matched robot)  domain={robot_domain}")
         else:
-            # Real robot: use FastDDS (ROS2 Humble default on most robots)
-            # Detect the Mac's local IP for this robot's subnet so FastDDS
-            # binds to the right network interface (WiFi), not loopback or VPN.
+            # Robot uses FastDDS — bind to the correct Mac WiFi interface
             mac_ip = self._get_local_ip_for(robot_ip)
             env["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
             env.pop("CYCLONEDDS_URI", None)
             fastdds_xml = self._generate_fastdds_xml(robot_ip, mac_ip)
-            # Set both old and new variable names (FastDDS 2.x vs 3.x)
             env["FASTRTPS_DEFAULT_PROFILES_FILE"] = fastdds_xml
             env["FASTDDS_DEFAULT_PROFILES_FILE"] = fastdds_xml
-            self._log(f"  DDS: FastDDS  robot={robot_ip}  mac={mac_ip or 'unknown'}")
+            self._log(f"  DDS: FastDDS (matched robot)  robot={robot_ip}  mac={mac_ip or 'unknown'}  domain={robot_domain}")
 
         # Build command
         rviz_config = os.path.join(_PKG_DIR, "default_view.rviz")
@@ -5704,6 +5734,8 @@ class RobotControlApp(QMainWindow):
                 start_new_session=True,
             )
             self._log(f"  RViz2 started (PID {self._rviz_process.pid}).")
+            # After a short delay, run ros2 topic list locally to confirm DDS discovery
+            QTimer.singleShot(4000, lambda: self._check_local_ros2_topics(env))
         except FileNotFoundError:
             self._log(
                 "ERROR: rviz2 executable not found in ros_env.\n"
@@ -5711,6 +5743,43 @@ class RobotControlApp(QMainWindow):
             )
         except Exception as e:
             self._log(f"ERROR launching RViz2: {e}")
+
+    def _check_local_ros2_topics(self, rviz_env):
+        """Run ros2 topic list locally (same DDS env as RViz) and log the result.
+
+        Called 4 s after RViz launches so DDS has time to discover peers.
+        If the topic list is empty, DDS discovery is not working — the RViz
+        window will be showing 'No data' for every display.
+        """
+        ros2_exe = os.path.join(rviz_env.get("CONDA_PREFIX", ""), "bin", "ros2")
+        if not os.path.isfile(ros2_exe):
+            return
+        self._log("--- Local DDS topic check (4 s after RViz start) ---")
+        try:
+            r = subprocess.run(
+                [ros2_exe, "topic", "list"],
+                env=rviz_env,
+                capture_output=True, text=True, timeout=8,
+            )
+            topics = [t for t in r.stdout.strip().splitlines() if t.startswith("/")]
+            if topics:
+                self._log(f"  DDS OK — {len(topics)} topic(s) visible:")
+                for t in topics:
+                    self._log(f"    {t}")
+            else:
+                self._log(
+                    "  DDS WARNING: no topics found on the Mac side.\n"
+                    "  RViz will show empty displays.\n"
+                    "  Check: same ROS_DOMAIN_ID on robot and Mac?\n"
+                    "         Robot firewall blocking UDP?\n"
+                    "         Robot using a different DDS middleware?"
+                )
+                if r.stderr.strip():
+                    self._log(f"  stderr: {r.stderr.strip()[:300]}")
+        except subprocess.TimeoutExpired:
+            self._log("  DDS check timed out (ros2 topic list took > 8 s).")
+        except Exception as e:
+            self._log(f"  DDS check error: {e}")
 
     def _stop_gazebo(self):
         """Kill any running Gazebo processes (tracked and stale) and free port 11345."""
