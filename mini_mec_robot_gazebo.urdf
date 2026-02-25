@@ -28,11 +28,10 @@
     </link>
 
     <!-- ==================== LEFT FRONT WHEEL (PASSIVE) ==================== -->
-    <joint name="lf_wheel_joint" type="continuous">
+    <joint name="lf_wheel_joint" type="fixed">
         <origin xyz="0.0789 0.0991 -0.0363" rpy="0 0 0"/>
         <parent link="base_link"/>
         <child link="lf_wheel_link"/>
-        <axis xyz="0 1 0"/>
     </joint>
 
     <link name="lf_wheel_link">
@@ -127,11 +126,10 @@
     </link>
 
     <!-- ==================== RIGHT FRONT WHEEL (PASSIVE) ==================== -->
-    <joint name="rf_wheel_joint" type="continuous">
+    <joint name="rf_wheel_joint" type="fixed">
         <origin xyz="0.0789 -0.0989 -0.0363" rpy="0 0 0"/>
         <parent link="base_link"/>
         <child link="rf_wheel_link"/>
-        <axis xyz="0 1 0"/>
     </joint>
 
     <link name="rf_wheel_link">
