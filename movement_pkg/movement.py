@@ -11,6 +11,7 @@ from geometry_msgs.msg import Twist
 # add custom imports below
 import math
 import os
+import tempfile
 import time
 # end custom imports
 
@@ -23,8 +24,8 @@ class Movement(Node):
 
         # customize init function below
         # Clear any leftover pause flag from a previous run
-        if os.path.exists('/tmp/movement_pause'):
-            os.remove('/tmp/movement_pause')
+        if os.path.exists(os.path.join(tempfile.gettempdir(), 'movement_pause')):
+            os.remove(os.path.join(tempfile.gettempdir(), 'movement_pause'))
 
         self.scan = None
         self.last_scan_time = None
@@ -118,7 +119,7 @@ class Movement(Node):
         """Main control loop running at 10 Hz."""
         twist = Twist()
 
-        if os.path.exists('/tmp/movement_pause'):
+        if os.path.exists(os.path.join(tempfile.gettempdir(), 'movement_pause')):
             twist.linear.x = 0.0
             twist.angular.z = 0.0
             self.cmd_vel_pub.publish(twist)
