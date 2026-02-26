@@ -2310,6 +2310,7 @@ class RobotControlApp(QMainWindow):
         self._workers = []
         self.ssh_client = None
         self._rviz_process = None
+        self._rviz_helpers = []   # helper processes started alongside RViz
         self._gazebo_process = None
         self._robosim_process = None
         self._sim_dialog = None
@@ -5640,6 +5641,214 @@ class RobotControlApp(QMainWindow):
         if ament_root not in existing:
             env["AMENT_PREFIX_PATH"] = (ament_root + ":" + existing).rstrip(":")
 
+    def _write_real_robot_rviz_config(self):
+        """Write a real-robot RViz config with an absolute path to our local URDF.
+
+        Uses 'Description Source: File' instead of subscribing to /robot_description
+        so that:
+          - Our local STL meshes (already resolved via movement_pkg ament package) are
+            shown instead of missing Wheeltec mesh files.
+          - Two robot models don't appear when the robot runs multiple
+            robot_state_publisher instances (each publishing /robot_description).
+        The robot's own /tf stream still drives all movement and positioning.
+        """
+        urdf_path = os.path.join(_PKG_DIR, "mini_mec_real_display.urdf")
+        config = f"""\
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 0
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /RobotModel1
+        - /Grid1
+        - /LaserScan1
+        - /Odometry1
+      Splitter Ratio: 0.5
+    Tree Height: 351
+  - Class: rviz_common/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 1
+      Class: rviz_default_plugins/RobotModel
+      Collision Enabled: false
+      Description File: "{urdf_path}"
+      Description Source: File
+      Description Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot_description
+      Enabled: true
+      Links:
+        All Links Enabled: true
+        Expand Joint Details: false
+        Expand Link Details: false
+        Expand Tree: false
+        Link Tree Style: Links in Alphabetic Order
+      Mass Properties:
+        Inertia: false
+        Mass: false
+      Name: RobotModel
+      TF Prefix: ""
+      Update Interval: 0
+      Value: true
+      Visual Enabled: true
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/LaserScan
+      Color: 0; 255; 0
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: LaserScan
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 4
+      Size (m): 0.019999999552965164
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scan
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Angle Tolerance: 0.10000000149011612
+      Class: rviz_default_plugins/Odometry
+      Covariance:
+        Orientation:
+          Alpha: 0.5
+          Color: 255; 255; 127
+          Color Style: Unique
+          Frame: Local
+          Offset: 1
+          Scale: 1
+          Value: false
+        Position:
+          Alpha: 0.30000001192092896
+          Color: 204; 51; 204
+          Scale: 1
+          Value: false
+        Value: false
+      Enabled: true
+      Keep: 50
+      Name: Odometry
+      Position Tolerance: 0.10000000149011612
+      Shape:
+        Alpha: 1
+        Axes Length: 0.30000001192092896
+        Axes Radius: 0.029999999329447746
+        Color: 255; 85; 0
+        Head Length: 0.07000000029802322
+        Head Radius: 0.029999999329447746
+        Shaft Length: 0.15000000596046448
+        Shaft Radius: 0.014999999664723873
+        Value: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /odom_combined
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: odom_combined
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 3.902963161468506
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 0.015398193150758743
+      Target Frame: base_footprint
+      Value: Orbit (rviz_default_plugins)
+      Yaw: 5.995403289794922
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 800
+  Hide Left Dock: false
+  Hide Right Dock: true
+  QMainWindow State: 000000ff00000000fd0000000100000000000001b0000002d9fc0200000002fb000000100044006900730070006c006100790073010000002c000001ae000000e300fffffffb0000000a0056006900650077007301000001db0000012a000000c600ffffff000002ff000002d900000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Views:
+    collapsed: false
+  Width: 1200
+  X: 207
+  Y: 128
+"""
+        out_path = os.path.join(_PKG_DIR, ".real_robot_view_generated.rviz")
+        with open(out_path, "w") as f:
+            f.write(config)
+        return out_path
+
     def _launch_rviz(self):
         """Launch RViz2 in a separate window via the conda ros_env environment."""
         # Guard against double-launch
@@ -5727,7 +5936,7 @@ class RobotControlApp(QMainWindow):
             mac_ip = self._get_local_ip_for(robot_ip)
             env["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
             env.pop("CYCLONEDDS_URI", None)
-            fastdds_xml = self._generate_fastdds_xml(robot_ip)
+            fastdds_xml = self._generate_fastdds_xml(robot_ip, mac_ip=mac_ip)
             env["FASTRTPS_DEFAULT_PROFILES_FILE"] = fastdds_xml
             env["FASTDDS_DEFAULT_PROFILES_FILE"] = fastdds_xml
             # UDPv4 transport avoids shared-memory issues on macOS (FastDDS 3.x)
@@ -5738,8 +5947,15 @@ class RobotControlApp(QMainWindow):
         # package://movement_pkg/meshes/*.STL → _PKG_DIR/meshes/*.STL
         self._setup_ament_package_for_rviz(env)
 
-        # Build command
-        rviz_config = os.path.join(_PKG_DIR, "default_view.rviz")
+        # Build command — use separate configs for Gazebo vs real robot.
+        # For real robot: generate the config dynamically so we can embed the
+        # absolute path to our local Gazebo URDF as the robot model source.
+        # This avoids (a) the Wheeltec mesh-not-found grey-box problem and
+        # (b) showing two models when two robot_state_publishers are running.
+        if robot_ip == "127.0.0.1":
+            rviz_config = os.path.join(_PKG_DIR, "default_view.rviz")
+        else:
+            rviz_config = self._write_real_robot_rviz_config()
         rviz_exe = os.path.join(conda_bin, "rviz2")
         cmd = [rviz_exe, "-d", rviz_config]
 
@@ -5760,6 +5976,14 @@ class RobotControlApp(QMainWindow):
             self._log(f"  RViz2 started (PID {self._rviz_process.pid}).")
             # After a short delay, run ros2 topic list locally to confirm DDS discovery
             QTimer.singleShot(4000, lambda: self._check_local_ros2_topics(env))
+            # 8 s later: dump local /tf_static to diagnose robot model positioning
+            QTimer.singleShot(8000, lambda: self._check_local_tf_static(env))
+            # 2 s: capture live /tf frames to see if odom_combined is flowing
+            if robot_ip != "127.0.0.1":
+                QTimer.singleShot(2000, lambda: self._check_local_tf_stream(env))
+            # Real-robot only: run diagnostics (e.g. read Wheeltec URDF laser joint)
+            if robot_ip != "127.0.0.1":
+                self._start_real_robot_rviz_helpers(env, conda_bin)
         except FileNotFoundError:
             self._log(
                 "ERROR: rviz2 executable not found in ros_env.\n"
@@ -5767,6 +5991,71 @@ class RobotControlApp(QMainWindow):
             )
         except Exception as e:
             self._log(f"ERROR launching RViz2: {e}")
+
+    def _start_real_robot_rviz_helpers(self, env, conda_bin):
+        """Run diagnostics when RViz connects to a real robot.
+
+        Checks clock skew (robot vs Mac) and reads the laser TF from /tf_static.
+        Clock skew > ~0.5 s can cause laser scan transforms to fail in RViz
+        (sensor data timestamps appear 'in the future' to the Mac's TF2 buffer).
+
+        NOTE: A separate TF-relay process is intentionally NOT started here.
+        Extra DDS participants on the Mac interfere with FastDDS discovery over
+        WiFi and cause RViz to lose all robot topics.
+        """
+        if not self.ssh_client:
+            return
+
+        # ── 1. Clock skew diagnostic ──────────────────────────────────────────
+        try:
+            _, out, _ = self.ssh_client.exec_command("date +%s.%N", timeout=5)
+            robot_time_str = out.read().decode().strip()
+            import time as _time
+            mac_time = _time.time()
+            robot_time = float(robot_time_str)
+            skew = robot_time - mac_time
+            self._log(f"--- Clock check: robot={robot_time:.3f}  mac={mac_time:.3f}  "
+                      f"skew={skew:+.3f} s ---")
+            if abs(skew) > 0.5:
+                self._log(
+                    f"  WARNING: clock skew {skew:+.3f} s  — laser scan TF lookups may fail.\n"
+                    "  Fix: run 'sudo ntpdate -u pool.ntp.org' on the robot, or\n"
+                    "       'sudo timedatectl set-ntp true' to enable automatic NTP sync."
+                )
+        except Exception as e:
+            self._log(f"  (clock check failed: {e})")
+
+        # ── 2. Laser/lidar TF diagnostic ──────────────────────────────────────
+        # Read /tf_static from the robot to confirm the laser frame name and
+        # transform.  The display URDF uses 'laser_link'; if the robot publishes
+        # a different name the laser scan will still work (it uses its own frame).
+        try:
+            diag_cmd = (
+                ROS_SOURCE_CMD + " && "
+                "timeout 6 ros2 topic echo --once /tf_static 2>/dev/null "
+                "| grep -B3 -A12 -iE 'laser|lidar' | head -60"
+            )
+            _, out, _ = self.ssh_client.exec_command(diag_cmd, timeout=12)
+            result = out.read().decode(errors="replace").strip()
+            if result:
+                self._log("--- Wheeltec laser TF (from /tf_static) ---")
+                for line in result.splitlines():
+                    self._log(f"  {line}")
+            else:
+                self._log("  (no laser/lidar transform in /tf_static — listing all static frames)")
+                _, out2, _ = self.ssh_client.exec_command(
+                    ROS_SOURCE_CMD + " && "
+                    "timeout 4 ros2 topic echo --once /tf_static 2>/dev/null "
+                    "| grep child_frame_id | head -20",
+                    timeout=10,
+                )
+                frames = out2.read().decode(errors="replace").strip()
+                if frames:
+                    self._log("  Available static frames:")
+                    for line in frames.splitlines():
+                        self._log(f"    {line}")
+        except Exception as e:
+            self._log(f"  (could not read laser TF: {e})")
 
     def _check_local_ros2_topics(self, rviz_env):
         """Run ros2 topic list locally (same DDS env as RViz) and log the result.
@@ -5804,6 +6093,173 @@ class RobotControlApp(QMainWindow):
             self._log("  DDS check timed out (ros2 topic list took > 8 s).")
         except Exception as e:
             self._log(f"  DDS check error: {e}")
+
+    def _check_local_tf_static(self, rviz_env):
+        """Dump /tf_static received locally (same DDS env as RViz) to diagnose robot model.
+
+        Called 8 s after RViz launches.  Logs every static transform so we can
+        confirm:
+          • base_footprint → base_link  (z offset = ground clearance)
+          • base_footprint → laser      (z offset = lidar height above base_footprint)
+        If /tf_static is empty, FastDDS Transient Local delivery over WiFi is failing
+        — that is why the laser/wheel links appear at world origin in RViz.
+        """
+        ros2_exe = os.path.join(rviz_env.get("CONDA_PREFIX", ""), "bin", "ros2")
+        if not os.path.isfile(ros2_exe):
+            return
+        self._log("--- Local /tf_static check (8 s after RViz start) ---")
+        try:
+            r = subprocess.run(
+                [ros2_exe, "topic", "echo", "--once", "/tf_static"],
+                env=rviz_env,
+                capture_output=True, text=True, timeout=10,
+            )
+            output = r.stdout.strip()
+            if not output:
+                self._log(
+                    "  WARNING: /tf_static is EMPTY on the Mac side.\n"
+                    "  FastDDS Transient Local QoS delivery over WiFi may be failing.\n"
+                    "  Robot model links without a TF frame will appear at world origin."
+                )
+                if r.stderr.strip():
+                    self._log(f"  stderr: {r.stderr.strip()[:200]}")
+                return
+            # Parse parent/child frame IDs + translation for a compact summary
+            lines = output.splitlines()
+            frames = []
+            current_parent = None
+            current_child = None
+            tx = ty = tz = None
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("frame_id:"):
+                    current_parent = stripped.split(":", 1)[1].strip().strip("'\"")
+                    current_child = None
+                    tx = ty = tz = None
+                elif stripped.startswith("child_frame_id:"):
+                    current_child = stripped.split(":", 1)[1].strip().strip("'\"")
+                    tx = ty = tz = None
+                elif stripped.startswith("x:") and current_child and tx is None:
+                    try:
+                        tx = float(stripped.split(":", 1)[1])
+                    except ValueError:
+                        pass
+                elif stripped.startswith("y:") and current_child and ty is None:
+                    try:
+                        ty = float(stripped.split(":", 1)[1])
+                    except ValueError:
+                        pass
+                elif stripped.startswith("z:") and current_child and tz is None:
+                    try:
+                        tz = float(stripped.split(":", 1)[1])
+                    except ValueError:
+                        pass
+                    if tx is not None and ty is not None and tz is not None:
+                        frames.append((current_parent or "?", current_child, tx, ty, tz))
+                        current_child = None
+                        tx = ty = tz = None
+            if frames:
+                self._log(f"  Static frames received ({len(frames)}):")
+                for parent, child, x, y, z in frames:
+                    self._log(f"    {parent:20s} → {child:25s}  xyz=({x:.4f}, {y:.4f}, {z:.4f})")
+            else:
+                self._log("  /tf_static received but could not parse frames — raw output:")
+                for line in lines[:30]:
+                    self._log(f"    {line}")
+        except subprocess.TimeoutExpired:
+            self._log("  /tf_static check timed out (no message in 10 s).")
+        except Exception as e:
+            self._log(f"  /tf_static check error: {e}")
+
+    def _check_local_tf_stream(self, rviz_env):
+        """Capture one /tf message and one /odom_combined message to identify the TF chain.
+
+        Called 2 s after RViz starts.  Shows:
+          - Which parent frames appear in /tf (esp. whether odom_combined is present)
+          - The EKF child_frame_id from /odom_combined (the frame the EKF localises into)
+        If the EKF child_frame_id is 'base_link' (not 'base_footprint'), the URDF root
+        must be 'base_link' for the robot model to stay visible.
+        """
+        ros2_exe = os.path.join(rviz_env.get("CONDA_PREFIX", ""), "bin", "ros2")
+        if not os.path.isfile(ros2_exe):
+            return
+        self._log("--- Local /tf + /odom_combined check (2 s after RViz start) ---")
+
+        # ── 1. One /tf message to see which parent frames flow ────────────────
+        try:
+            r = subprocess.run(
+                [ros2_exe, "topic", "echo", "--once", "/tf"],
+                env=rviz_env,
+                capture_output=True, text=True, timeout=6,
+            )
+            tf_out = r.stdout.strip()
+        except subprocess.TimeoutExpired:
+            tf_out = ""
+        except Exception as e:
+            tf_out = ""
+            self._log(f"  /tf echo error: {e}")
+
+        if not tf_out:
+            self._log("  WARNING: NO /tf message received — EKF not publishing or DDS not flowing.")
+        else:
+            parent_counts: dict = {}
+            child_frames: list = []
+            for line in tf_out.splitlines():
+                s = line.strip()
+                if s.startswith("frame_id:"):
+                    p = s.split(":", 1)[1].strip().strip("'\"")
+                    parent_counts[p] = parent_counts.get(p, 0) + 1
+                elif s.startswith("child_frame_id:"):
+                    c = s.split(":", 1)[1].strip().strip("'\"")
+                    if c not in child_frames:
+                        child_frames.append(c)
+            if parent_counts or child_frames:
+                self._log("  /tf message received:")
+                for parent, count in sorted(parent_counts.items(), key=lambda x: -x[1]):
+                    self._log(f"    parent: {parent}  ({count} transforms)")
+                self._log(f"    children: {', '.join(child_frames)}")
+                if "odom_combined" not in parent_counts:
+                    self._log(
+                        "  WARNING: odom_combined is NOT a parent frame in /tf.\n"
+                        "  The fixed frame odom_combined will be unknown to RViz → model hidden.\n"
+                        "  Check the EKF output_frame param on the robot."
+                    )
+            else:
+                self._log(f"  /tf received but could not parse — raw (200 chars): {tf_out[:200]}")
+
+        # ── 2. One /odom_combined message to get EKF child_frame_id ──────────
+        try:
+            r2 = subprocess.run(
+                [ros2_exe, "topic", "echo", "--once", "/odom_combined"],
+                env=rviz_env,
+                capture_output=True, text=True, timeout=6,
+            )
+            odom_out = r2.stdout.strip()
+        except subprocess.TimeoutExpired:
+            odom_out = ""
+        except Exception as e:
+            odom_out = ""
+            self._log(f"  /odom_combined echo error: {e}")
+
+        if not odom_out:
+            self._log("  /odom_combined: no message received.")
+        else:
+            odom_frame = odom_child = None
+            for line in odom_out.splitlines():
+                s = line.strip()
+                if s.startswith("frame_id:") and odom_frame is None:
+                    odom_frame = s.split(":", 1)[1].strip().strip("'\"")
+                elif s.startswith("child_frame_id:") and odom_child is None:
+                    odom_child = s.split(":", 1)[1].strip().strip("'\"")
+            if odom_frame or odom_child:
+                self._log(f"  /odom_combined: frame_id={odom_frame}  child_frame_id={odom_child}")
+                if odom_child and odom_child != "base_footprint":
+                    self._log(
+                        f"  NOTE: EKF uses '{odom_child}' (not 'base_footprint') as robot frame.\n"
+                        f"  The URDF root must be '{odom_child}' for the model to track correctly."
+                    )
+            else:
+                self._log(f"  /odom_combined received but could not parse — raw (200 chars): {odom_out[:200]}")
 
     def _stop_gazebo(self):
         """Kill any running Gazebo processes (tracked and stale) and free port 11345."""
@@ -5971,6 +6427,15 @@ class RobotControlApp(QMainWindow):
                 self._rviz_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._rviz_process.kill()
+
+        for proc in getattr(self, '_rviz_helpers', []):
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        self._rviz_helpers = []
 
         self._stop_gazebo()
 

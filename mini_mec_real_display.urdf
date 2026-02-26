@@ -1,0 +1,75 @@
+<?xml version="1.0" ?>
+<!-- Display URDF for the Wheeltec mini-mec robot.
+     Single link: base_footprint.  ALL geometry lives directly on this link.
+     RViz needs ONLY odom_combined→base_footprint from /tf (EKF output).
+     No dependency on base_footprint→base_link or any other /tf_static frame.
+
+     Offsets verified from real-robot /tf_static diagnostic:
+       base_link → laser_link   xyz=(0.0316, 0.0001, 0.0950) rel. to base_link
+     base_link height above base_footprint derived from wheel geometry:
+       wheel_radius=0.04m, wheel_joint_z=-0.0363 rel. to base_link
+       → base_link = 0.04 + 0.0363 = 0.0763 m above base_footprint
+
+     Body centre  = 0.0763 + 0.05  = 0.1263 m above base_footprint
+     Body top     = 0.1263 + 0.05  = 0.1763 m above base_footprint
+     Wheel centre = 0.0763 - 0.0363 = 0.04 m  above base_footprint (= wheel radius ✓)
+     Laser centre = body_top + 0.02 = 0.1963 m (sits on top of body, not inside it) -->
+<robot name="wheeltec_display">
+
+    <link name="base_footprint">
+
+        <!-- Body — white so it is distinct from the grey TF-error colour -->
+        <visual>
+            <origin xyz="0 0 0.1263" rpy="0 0 0"/>
+            <geometry>
+                <box size="0.27 0.20 0.10"/>
+            </geometry>
+            <material name="robot_body">
+                <color rgba="1.0 1.0 1.0 1"/>
+            </material>
+        </visual>
+
+        <!-- Laser lidar cylinder — sits on top of the body box.
+             body_top = 0.0763 + 0.05 + 0.05 = 0.1763 m
+             laser_centre = body_top + half_cylinder_length = 0.1763 + 0.02 = 0.1963 m -->
+        <visual>
+            <origin xyz="0.0316 0.0001 0.1963" rpy="0 0 0"/>
+            <geometry>
+                <cylinder radius="0.035" length="0.04"/>
+            </geometry>
+            <material name="lidar">
+                <color rgba="0.2 0.2 0.2 1"/>
+            </material>
+        </visual>
+
+        <!-- Left-front wheel -->
+        <visual>
+            <origin xyz="0.0789 0.0991 0.04" rpy="1.5708 0 0"/>
+            <geometry><cylinder radius="0.04" length="0.04"/></geometry>
+            <material name="wheel"><color rgba="0.1 0.1 0.1 1"/></material>
+        </visual>
+
+        <!-- Left-back wheel -->
+        <visual>
+            <origin xyz="-0.0930 0.0991 0.04" rpy="1.5708 0 0"/>
+            <geometry><cylinder radius="0.04" length="0.04"/></geometry>
+            <material name="wheel"><color rgba="0.1 0.1 0.1 1"/></material>
+        </visual>
+
+        <!-- Right-back wheel -->
+        <visual>
+            <origin xyz="-0.0930 -0.0989 0.04" rpy="1.5708 0 0"/>
+            <geometry><cylinder radius="0.04" length="0.04"/></geometry>
+            <material name="wheel"><color rgba="0.1 0.1 0.1 1"/></material>
+        </visual>
+
+        <!-- Right-front wheel -->
+        <visual>
+            <origin xyz="0.0789 -0.0989 0.04" rpy="1.5708 0 0"/>
+            <geometry><cylinder radius="0.04" length="0.04"/></geometry>
+            <material name="wheel"><color rgba="0.1 0.1 0.1 1"/></material>
+        </visual>
+
+    </link>
+
+</robot>
