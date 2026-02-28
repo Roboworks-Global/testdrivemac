@@ -750,6 +750,65 @@ class CondaInstallWorker(QThread):
             self.finished.emit(False)
 
 
+
+class _ClaudeWorker(QThread):
+    """Calls the Anthropic Claude API with SSE streaming in a background thread."""
+    token_received = pyqtSignal(str)
+    finished       = pyqtSignal()
+    error          = pyqtSignal(str)
+
+    def __init__(self, api_key, messages, model="claude-sonnet-4-6"):
+        super().__init__()
+        self.api_key  = api_key
+        self.messages = messages
+        self.model    = model
+
+    def run(self):
+        try:
+            payload = json.dumps({
+                "model": self.model,
+                "max_tokens": 4096,
+                "stream": True,
+                "messages": self.messages,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    chunk = line[5:].strip()
+                    if chunk == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(chunk)
+                        if obj.get("type") == "content_block_delta":
+                            delta = obj.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                self.token_received.emit(delta.get("text", ""))
+                    except json.JSONDecodeError:
+                        pass
+            self.finished.emit()
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            try:
+                msg = json.loads(body).get("error", {}).get("message", body[:300])
+            except Exception:
+                msg = body[:300]
+            self.error.emit(f"API error {e.code}: {msg}")
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 # --- Drag-and-drop function buttons for Simple View ---
 
 class DraggableFunctionButton(QPushButton):
@@ -2314,6 +2373,9 @@ class RobotControlApp(QMainWindow):
         self._gazebo_process = None
         self._robosim_process = None
         self._custom_apps = []  # list of (app_name, folder_path) tuples
+        self._claude_api_key  = self._load_claude_api_key()
+        self._claude_worker   = None
+        self._ai_history      = []   # list of {"role":..., "content":...}
         self._sim_dialog = None
         self._syncing = False
         self._full_view_current_file = None
@@ -2375,6 +2437,7 @@ class RobotControlApp(QMainWindow):
         self._build_robot_control_tab()
         self._build_node_canvas_tab()
         self._build_code_editor_tab()
+        self._build_ask_ai_tab()
         self._build_roboapps_tab()
 
         self._refresh_profile_combo()
@@ -3862,7 +3925,282 @@ class RobotControlApp(QMainWindow):
         self._autosave_timer.start(5000)
 
     # ------------------------------------------------------------------ #
-    #  Tab 4: RoboApps                                                     #
+    #  Tab 4: AI Agent                                                     #
+    # ------------------------------------------------------------------ #
+
+    _CLAUDE_KEY_FILE = os.path.expanduser("~/.testdrive_claude_key")
+
+    def _load_claude_api_key(self):
+        try:
+            with open(self._CLAUDE_KEY_FILE, "r") as f:
+                return f.read().strip() or None
+        except OSError:
+            return None
+
+    def _save_claude_api_key(self, key):
+        try:
+            with open(self._CLAUDE_KEY_FILE, "w") as f:
+                f.write(key)
+            os.chmod(self._CLAUDE_KEY_FILE, 0o600)
+        except OSError:
+            pass
+
+    def _make_send_icon(self, size=44):
+        """Draw a white upward-arrow inside a white circle on a transparent background."""
+        scale = 2                          # render at 2× for HiDPI sharpness
+        px = QPixmap(size * scale, size * scale)
+        px.setDevicePixelRatio(scale)
+        px.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        pen = QPen(QColor("white"))
+        pen.setWidthF(2.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        s = float(size)
+        m = 2.0
+        # Outer circle
+        painter.drawEllipse(QRectF(m, m, s - 2 * m, s - 2 * m))
+
+        cx   = s / 2.0
+        top  = s * 0.27          # arrowhead tip
+        bot  = s * 0.68          # shaft base
+        hw   = s * 0.15          # arrowhead half-width
+        mid  = s * 0.42          # arrowhead shoulder y
+
+        # Shaft
+        painter.drawLine(QPointF(cx, bot), QPointF(cx, top))
+        # Left wing
+        painter.drawLine(QPointF(cx, top), QPointF(cx - hw, mid))
+        # Right wing
+        painter.drawLine(QPointF(cx, top), QPointF(cx + hw, mid))
+
+        painter.end()
+        return QIcon(px)
+
+    def _build_ask_ai_tab(self):
+        tab = QWidget()
+        tab.setStyleSheet("background-color: #1E1E1E;")
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # --- Top bar ---
+        top_bar = QWidget()
+        top_bar.setStyleSheet("background-color: #2C2C2E; border-bottom: 1px solid #3A3A3C;")
+        top_bar.setFixedHeight(44)
+        tb_layout = QHBoxLayout(top_bar)
+        tb_layout.setContentsMargins(12, 0, 12, 0)
+
+        api_key_btn = QPushButton("API Key")
+        api_key_btn.setFixedHeight(28)
+        api_key_btn.setStyleSheet(
+            "QPushButton { background: #3A3A3C; color: #EBEBF5; border-radius: 7px;"
+            " padding: 0 12px; font-size: 12px; border: none; }"
+            "QPushButton:hover { background: #48484A; }"
+            "QPushButton:pressed { background: #636366; }"
+        )
+        api_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        api_key_btn.clicked.connect(self._show_api_key_dialog)
+        tb_layout.addWidget(api_key_btn)
+        tb_layout.addStretch()
+        outer.addWidget(top_bar)
+
+        # Content area — proportions (out of 10 parts):
+        #   top gap  :  1 = 10%
+        #   terminal :  6 = 60%
+        #   prompt   :  2 = 20%  (80% wide, centred)
+        #   bottom   :  1 = 10%
+
+        # Top gap (10%)
+        outer.addStretch(1)
+
+        # Terminal output (60%)
+        self._ai_output = QTextEdit()
+        self._ai_output.setReadOnly(True)
+        self._ai_output.setStyleSheet(
+            "QTextEdit { background-color: #1E1E1E; color: #F0F0F0;"
+            " border: none; padding: 14px; }"
+        )
+        mono = QFont("Menlo", 13)
+        mono.setFixedPitch(True)
+        self._ai_output.setFont(mono)
+        outer.addWidget(self._ai_output, 6)
+
+        # Prompt row — 80% wide, centred (20%)
+        prompt_row = QWidget()
+        prompt_row.setStyleSheet("background: transparent;")
+        pr_layout = QHBoxLayout(prompt_row)
+        pr_layout.setContentsMargins(0, 0, 0, 0)
+        pr_layout.setSpacing(0)
+
+        prompt_container = QWidget()
+        prompt_container.setStyleSheet("background-color: #2C2C2E; border-radius: 12px;")
+        p_layout = QHBoxLayout(prompt_container)
+        p_layout.setContentsMargins(12, 12, 12, 12)
+        p_layout.setSpacing(10)
+
+        self._ai_input = QPlainTextEdit()
+        self._ai_input.setPlaceholderText(
+            "I can help you to generate code, create an app or debug your project."
+        )
+        self._ai_input.setStyleSheet(
+            "QPlainTextEdit { background-color: #3A3A3C; color: #F0F0F0;"
+            " border: 1px solid #48484A; border-radius: 10px;"
+            " font-size: 13px; padding: 8px; }"
+        )
+        mono_input = QFont("Menlo", 13)
+        mono_input.setFixedPitch(True)
+        self._ai_input.setFont(mono_input)
+        p_layout.addWidget(self._ai_input, 1)
+
+        self._ask_ai_btn = QPushButton()
+        icon_size = 44
+        self._ask_ai_btn.setFixedSize(icon_size, icon_size)
+        self._ask_ai_btn.setIcon(self._make_send_icon(icon_size))
+        self._ask_ai_btn.setIconSize(QSize(icon_size, icon_size))
+        self._ask_ai_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 22px; }"
+            "QPushButton:hover { background: rgba(255,255,255,25); }"
+            "QPushButton:pressed { background: rgba(255,255,255,55); }"
+            "QPushButton:disabled { background: transparent; }"
+        )
+        self._ask_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ask_ai_btn.setToolTip("Send")
+        self._ask_ai_btn.clicked.connect(self._ask_ai)
+        p_layout.addWidget(self._ask_ai_btn)
+
+        pr_layout.addStretch(1)          # 10% left margin
+        pr_layout.addWidget(prompt_container, 8)  # 80% width
+        pr_layout.addStretch(1)          # 10% right margin
+
+        outer.addWidget(prompt_row, 2)
+
+        # Bottom gap (10%)
+        outer.addStretch(1)
+
+        self.tabs.addTab(tab, "AI Agent")
+
+    def _show_api_key_dialog(self):
+        """Popup to enter/save the Claude API key."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Enter Claude API Key")
+        dlg.setFixedSize(480, 150)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+        dlg.setStyleSheet("background-color: #2C2C2E; color: white;")
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        key_input = QLineEdit()
+        key_input.setPlaceholderText("sk-ant-...")
+        key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        if self._claude_api_key:
+            key_input.setText(self._claude_api_key)
+        key_input.setStyleSheet(
+            "QLineEdit { background: #3A3A3C; color: white; border: 1px solid #48484A;"
+            " border-radius: 8px; padding: 8px 12px; font-size: 13px; }"
+        )
+        layout.addWidget(key_input)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setFixedHeight(32)
+        cancel_btn.setStyleSheet(
+            "QPushButton { background: #48484A; color: white; border-radius: 8px;"
+            " padding: 0 16px; font-size: 13px; border: none; }"
+            "QPushButton:hover { background: #636366; }"
+        )
+        save_btn = QPushButton("Save")
+        save_btn.setFixedHeight(32)
+        save_btn.setStyleSheet(
+            "QPushButton { background: #007AFF; color: white; border-radius: 8px;"
+            " padding: 0 16px; font-size: 13px; border: none; }"
+            "QPushButton:hover { background: #005ECB; }"
+            "QPushButton:pressed { background: #004AAD; }"
+        )
+        cancel_btn.clicked.connect(dlg.reject)
+        save_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            key = key_input.text().strip()
+            if key:
+                self._claude_api_key = key
+                self._save_claude_api_key(key)
+
+    def _ask_ai(self):
+        """Send the prompt to Claude and stream the response into the terminal."""
+        prompt = self._ai_input.toPlainText().strip()
+        if not prompt:
+            return
+        if not self._claude_api_key:
+            self._ai_output.append(
+                '<span style="color:#FF453A;">⚠ No API key set. '
+                'Click <b>API Key</b> to add your Claude API key.</span>'
+            )
+            return
+        if self._claude_worker and self._claude_worker.isRunning():
+            return  # already busy
+
+        # Echo prompt in terminal
+        self._ai_input.clear()
+        self._ai_output.append(
+            f'<span style="color:#30D158; font-weight:bold;">▶ You</span>'
+            f'<br><span style="color:#EBEBF5;">{prompt}</span><br>'
+        )
+        self._ai_output.append('<span style="color:#636366;">─────────────────────</span>')
+        self._ai_output.append('<span style="color:#0A84FF; font-weight:bold;">Claude</span><br>')
+        self._ai_output.moveCursor(QTextCursor.MoveOperation.End)
+
+        # Track conversation history
+        self._ai_history.append({"role": "user", "content": prompt})
+
+        self._ask_ai_btn.setEnabled(False)
+        self._claude_worker = _ClaudeWorker(self._claude_api_key, self._ai_history)
+        self._claude_worker.token_received.connect(self._on_ai_token)
+        self._claude_worker.finished.connect(self._on_ai_finished)
+        self._claude_worker.error.connect(self._on_ai_error)
+        self._claude_worker.start()
+        self._ai_response_buffer = ""
+
+    def _on_ai_token(self, token):
+        cursor = self._ai_output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(token)
+        self._ai_output.setTextCursor(cursor)
+        self._ai_output.ensureCursorVisible()
+        self._ai_response_buffer = getattr(self, "_ai_response_buffer", "") + token
+
+    def _on_ai_finished(self):
+        self._ai_output.append("\n")
+        self._ai_output.moveCursor(QTextCursor.MoveOperation.End)
+        # Save assistant reply to history
+        reply = getattr(self, "_ai_response_buffer", "")
+        if reply:
+            self._ai_history.append({"role": "assistant", "content": reply})
+        self._ai_response_buffer = ""
+        self._ask_ai_btn.setEnabled(True)
+
+    def _on_ai_error(self, msg):
+        self._ai_output.append(
+            f'<br><span style="color:#FF453A;">Error: {msg}</span><br>'
+        )
+        self._ai_output.moveCursor(QTextCursor.MoveOperation.End)
+        self._ai_response_buffer = ""
+        self._ask_ai_btn.setEnabled(True)
+
+    # ------------------------------------------------------------------ #
+    #  Tab 5: RoboApps                                                     #
     # ------------------------------------------------------------------ #
 
     def _make_app_icon_widget(self, symbol, label_text, bg_color, hover_color,
@@ -3977,6 +4315,42 @@ class RobotControlApp(QMainWindow):
         self._conda_icon_added = False
         # Check asynchronously so it doesn't delay UI startup
         QTimer.singleShot(300, self._check_and_add_conda_icon)
+        # Restore any custom apps saved from a previous session
+        QTimer.singleShot(400, self._restore_custom_apps)
+
+    # ------------------------------------------------------------------ #
+    #  Custom app persistence                                             #
+    # ------------------------------------------------------------------ #
+
+    _CUSTOM_APPS_FILE = os.path.expanduser("~/.testdrive_custom_apps.json")
+
+    def _save_custom_apps(self):
+        """Persist the custom apps list to disk."""
+        try:
+            with open(self._CUSTOM_APPS_FILE, "w") as f:
+                json.dump(self._custom_apps, f, indent=2)
+        except OSError:
+            pass
+
+    def _restore_custom_apps(self):
+        """Re-create custom app icons from the saved list on startup."""
+        try:
+            with open(self._CUSTOM_APPS_FILE, "r") as f:
+                saved = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        seen = set()
+        for entry in saved:
+            # Saved as [app_name, folder_path]
+            if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+                continue
+            app_name, folder_path = entry
+            if folder_path in seen:
+                continue          # skip duplicates
+            seen.add(folder_path)
+            self._add_custom_app_to_roboapps(app_name, folder_path, _save=False)
+        # Rebuild the file without duplicates
+        self._save_custom_apps()
 
     # ------------------------------------------------------------------ #
     #  Conda detection, icon, and installation helpers                    #
@@ -4061,9 +4435,14 @@ class RobotControlApp(QMainWindow):
             app_name = os.path.basename(folder)
             self._add_custom_app_to_roboapps(app_name, folder)
 
-    def _add_custom_app_to_roboapps(self, app_name, folder_path):
-        """Add a custom app icon to the RoboApps tab."""
+    def _add_custom_app_to_roboapps(self, app_name, folder_path, _save=True):
+        """Add a custom app icon to the RoboApps tab (idempotent by folder path)."""
+        # Prevent duplicates
+        if any(fp == folder_path for _, fp in self._custom_apps):
+            return
         self._custom_apps.append((app_name, folder_path))
+        if _save:
+            self._save_custom_apps()
         # Pick the main Python script (alphabetically first .py file)
         try:
             py_files = sorted(
