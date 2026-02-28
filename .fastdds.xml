@@ -2,12 +2,6 @@
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
   <participant profile_name="participant_profile" is_default_profile="true">
     <rtps>
-      <defaultUnicastLocatorList>
-        <locator><udpv4><address>192.168.1.170</address></udpv4></locator>
-      </defaultUnicastLocatorList>
-      <metatrafficUnicastLocatorList>
-        <locator><udpv4><address>192.168.1.170</address></udpv4></locator>
-      </metatrafficUnicastLocatorList>
       <builtin>
         <initialPeersList>
           <locator><udpv4><address>192.168.1.177</address><port>7410</port></udpv4></locator>

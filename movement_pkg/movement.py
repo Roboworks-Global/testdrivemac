@@ -30,8 +30,8 @@ class Movement(Node):
         self.scan = None
         self.last_scan_time = None
 
-        self.obstacle_distance = 1.00  # 30 cm — gives room to stop
-        self.forward_speed = 0.80       # m/s
+        self.obstacle_distance = 0.30  # 30 cm — gives room to stop
+        self.forward_speed = 0.30       # m/s
         self.backward_speed = 0.20      # m/s
         self.turn_speed = 0.40          # rad/s
         self.turn_cw_deg = 90.0          # degrees clockwise

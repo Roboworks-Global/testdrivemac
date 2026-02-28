@@ -39,31 +39,56 @@ echo conda found: %CONDA_EXE%
 REM Step 2: Create ros_env if it doesn't already exist
 "%CONDA_EXE%" env list | findstr /C:"ros_env" >nul 2>&1
 if %ERRORLEVEL% == 0 (
-    echo Environment 'ros_env' already exists. Skipping creation.
-    goto :configure_channels
+    echo Environment 'ros_env' already exists.
+) else (
+    echo.
+    echo Creating 'ros_env' (this may take a few minutes)...
+    echo.
+    "%CONDA_EXE%" create -n ros_env -y -c conda-forge -c robostack-humble python=3.11
+    if %ERRORLEVEL% neq 0 (
+        echo ERROR: conda create failed. See output above.
+        exit /b 1
+    )
 )
 
+REM Step 3: Install / verify all required packages (safe to re-run)
 echo.
-echo Creating 'ros_env' with ROS2 Humble Desktop + CycloneDDS...
+echo Installing / verifying required packages in ros_env...
 echo   (This may take 10-20 minutes on first install)
 echo.
 
-"%CONDA_EXE%" create -n ros_env -y ^
+"%CONDA_EXE%" install -n ros_env -y ^
     -c conda-forge ^
     -c robostack-humble ^
     ros-humble-desktop ^
     ros-humble-rmw-cyclonedds-cpp ^
+    ros-humble-rmw-fastrtps-cpp ^
     ros-humble-xacro ^
-    ros-humble-robot-state-publisher
+    ros-humble-robot-state-publisher ^
+    ros-humble-gazebo-ros-pkgs
 
 if %ERRORLEVEL% neq 0 (
     echo.
-    echo ERROR: conda create failed. See output above.
-    exit /b 1
+    echo WARNING: Some packages may not be available for Windows.
+    echo   ros-humble-gazebo-ros-pkgs is optional - Gazebo Classic has limited Windows support.
+    echo   Retrying without Gazebo packages...
+    echo.
+    "%CONDA_EXE%" install -n ros_env -y ^
+        -c conda-forge ^
+        -c robostack-humble ^
+        ros-humble-desktop ^
+        ros-humble-rmw-cyclonedds-cpp ^
+        ros-humble-rmw-fastrtps-cpp ^
+        ros-humble-xacro ^
+        ros-humble-robot-state-publisher
+    if %ERRORLEVEL% neq 0 (
+        echo ERROR: Package installation failed. See output above.
+        exit /b 1
+    )
 )
 
 :configure_channels
-REM Step 3: Add robostack-humble channel to the environment
+REM Step 4: Add robostack-humble channel to the environment
 echo.
 echo Configuring channels in ros_env...
 "%CONDA_EXE%" run -n ros_env conda config --env --add channels robostack-humble 2>nul
