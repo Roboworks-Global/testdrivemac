@@ -751,26 +751,225 @@ class CondaInstallWorker(QThread):
 
 
 
+def _draw_send_icon(size=44):
+    """White upward-arrow inside a white circle on transparent background."""
+    scale = 2
+    px = QPixmap(size * scale, size * scale)
+    px.setDevicePixelRatio(scale)
+    px.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(px)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("white"))
+    pen.setWidthF(2.2)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    s, m = float(size), 2.0
+    painter.drawEllipse(QRectF(m, m, s - 2*m, s - 2*m))
+    cx = s / 2.0
+    painter.drawLine(QPointF(cx, s*0.68), QPointF(cx, s*0.27))
+    painter.drawLine(QPointF(cx, s*0.27), QPointF(cx - s*0.15, s*0.42))
+    painter.drawLine(QPointF(cx, s*0.27), QPointF(cx + s*0.15, s*0.42))
+    painter.end()
+    return QIcon(px)
+
+
+def _draw_ai_circle_icon(size=36):
+    """White 'AI' text inside a white circle on transparent background."""
+    scale = 2
+    px = QPixmap(size * scale, size * scale)
+    px.setDevicePixelRatio(scale)
+    px.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(px)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("white"))
+    pen.setWidthF(1.8)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    s, m = float(size), 2.0
+    painter.drawEllipse(QRectF(m, m, s - 2*m, s - 2*m))
+    f = QFont("Helvetica Neue", max(1, int(s * 0.30)))
+    f.setBold(True)
+    painter.setFont(f)
+    painter.setPen(QColor("white"))
+    painter.drawText(QRectF(0, 0, s, s), Qt.AlignmentFlag.AlignCenter, "AI")
+    painter.end()
+    return QIcon(px)
+
+
+def _ai_system_prompt():
+    roboapps_dir = os.path.join(_PKG_DIR, "roboapps")
+    return (
+        "You are an AI assistant built into TestDrive, a macOS app for controlling "
+        "and programming robots. You run directly on the user's Mac.\n\n"
+        "Your two main functions:\n"
+        "1. **Debug code** — Analyse code the user shares, find bugs, return fixes.\n"
+        "2. **Create new Python apps** — Write complete, runnable Python scripts.\n"
+        "   Format rules for new apps:\n"
+        "   • All code in a single ```python block.\n"
+        "   • First line inside the block must be: # APP_NAME: AppName\n"
+        "     (CamelCase, no spaces — use the name the user specified).\n"
+        f"   • TestDrive will create {roboapps_dir}/<AppName>/<AppName>.py automatically\n"
+        "     and add a launch icon to RoboApps.\n\n"
+        "Be concise. Always produce complete runnable code for new apps."
+    )
+
+
+class _AIChatDialog(QDialog):
+    """Floating AI chat dialog — same functionality as the AI Agent tab."""
+
+    def __init__(self, api_key_getter, on_response_complete=None, parent=None):
+        super().__init__(parent)
+        self._get_key = api_key_getter
+        self._on_complete = on_response_complete
+        self._history = []
+        self._worker  = None
+        self._buffer  = ""
+        self.setWindowTitle("AI Agent")
+        self.resize(700, 520)
+        self.setStyleSheet("background-color: #1E1E1E;")
+        self._build_ui()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._output = QTextEdit()
+        self._output.setReadOnly(True)
+        self._output.setStyleSheet(
+            "QTextEdit { background-color: #1E1E1E; color: #F0F0F0;"
+            " border: none; padding: 14px; }"
+        )
+        mono = QFont("Menlo", 13)
+        mono.setFixedPitch(True)
+        self._output.setFont(mono)
+        outer.addWidget(self._output, 7)
+
+        prompt_row = QWidget()
+        prompt_row.setStyleSheet("background: transparent;")
+        pr = QHBoxLayout(prompt_row)
+        pr.setContentsMargins(0, 0, 0, 0)
+        pr.setSpacing(0)
+
+        box = QWidget()
+        box.setStyleSheet("background-color: #2C2C2E; border-radius: 12px;")
+        pl = QHBoxLayout(box)
+        pl.setContentsMargins(12, 12, 12, 12)
+        pl.setSpacing(10)
+
+        self._input = QPlainTextEdit()
+        self._input.setPlaceholderText(
+            "I can help you to generate code, create an app or debug your project."
+        )
+        self._input.setStyleSheet(
+            "QPlainTextEdit { background-color: #3A3A3C; color: #F0F0F0;"
+            " border: 1px solid #48484A; border-radius: 10px;"
+            " font-size: 13px; padding: 8px; }"
+        )
+        mono2 = QFont("Menlo", 13)
+        mono2.setFixedPitch(True)
+        self._input.setFont(mono2)
+        pl.addWidget(self._input, 1)
+
+        self._send_btn = QPushButton()
+        self._send_btn.setFixedSize(44, 44)
+        self._send_btn.setIcon(_draw_send_icon(44))
+        self._send_btn.setIconSize(QSize(44, 44))
+        self._send_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 22px; }"
+            "QPushButton:hover { background: rgba(255,255,255,25); }"
+            "QPushButton:pressed { background: rgba(255,255,255,55); }"
+            "QPushButton:disabled { background: transparent; }"
+        )
+        self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._send_btn.clicked.connect(self._send)
+        pl.addWidget(self._send_btn)
+
+        pr.addStretch(1)
+        pr.addWidget(box, 8)
+        pr.addStretch(1)
+        outer.addWidget(prompt_row, 3)
+
+    def _send(self):
+        prompt = self._input.toPlainText().strip()
+        if not prompt:
+            return
+        key = self._get_key()
+        if not key:
+            self._output.append(
+                '<span style="color:#FF453A;">⚠ No API key — set it in the AI Agent tab.</span>'
+            )
+            return
+        if self._worker and self._worker.isRunning():
+            return
+        self._input.clear()
+        self._output.append(
+            f'<span style="color:#30D158;font-weight:bold;">▶ You</span>'
+            f'<br><span style="color:#EBEBF5;">{prompt}</span><br>'
+        )
+        self._output.append('<span style="color:#636366;">─────────────────────</span>')
+        self._output.append('<span style="color:#0A84FF;font-weight:bold;">Claude</span><br>')
+        self._output.moveCursor(QTextCursor.MoveOperation.End)
+        self._history.append({"role": "user", "content": prompt})
+        self._send_btn.setEnabled(False)
+        self._worker = _ClaudeWorker(key, self._history, _ai_system_prompt())
+        self._worker.token_received.connect(self._on_token)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+        self._buffer = ""
+
+    def _on_token(self, token):
+        cur = self._output.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        cur.insertText(token)
+        self._output.setTextCursor(cur)
+        self._output.ensureCursorVisible()
+        self._buffer += token
+
+    def _on_finished(self):
+        self._output.append("\n")
+        self._output.moveCursor(QTextCursor.MoveOperation.End)
+        if self._buffer:
+            self._history.append({"role": "assistant", "content": self._buffer})
+            if self._on_complete:
+                self._on_complete(self._buffer)
+        self._buffer = ""
+        self._send_btn.setEnabled(True)
+
+    def _on_error(self, msg):
+        self._output.append(f'<br><span style="color:#FF453A;">Error: {msg}</span><br>')
+        self._output.moveCursor(QTextCursor.MoveOperation.End)
+        self._buffer = ""
+        self._send_btn.setEnabled(True)
+
+
 class _ClaudeWorker(QThread):
     """Calls the Anthropic Claude API with SSE streaming in a background thread."""
     token_received = pyqtSignal(str)
     finished       = pyqtSignal()
     error          = pyqtSignal(str)
 
-    def __init__(self, api_key, messages, model="claude-sonnet-4-6"):
+    def __init__(self, api_key, messages, system_prompt="", model="claude-sonnet-4-6"):
         super().__init__()
-        self.api_key  = api_key
-        self.messages = messages
-        self.model    = model
+        self.api_key       = api_key
+        self.messages      = messages
+        self.system_prompt = system_prompt
+        self.model         = model
 
     def run(self):
         try:
-            payload = json.dumps({
+            payload_dict = {
                 "model": self.model,
                 "max_tokens": 4096,
                 "stream": True,
                 "messages": self.messages,
-            }).encode("utf-8")
+            }
+            if self.system_prompt:
+                payload_dict["system"] = self.system_prompt
+            payload = json.dumps(payload_dict).encode("utf-8")
             req = urllib.request.Request(
                 "https://api.anthropic.com/v1/messages",
                 data=payload,
@@ -2373,6 +2572,9 @@ class RobotControlApp(QMainWindow):
         self._gazebo_process = None
         self._robosim_process = None
         self._custom_apps = []  # list of (app_name, folder_path) tuples
+        self._custom_app_widgets = []   # list of (container_widget, x_badge)
+        self._roboapps_delete_mode = False
+        self._ai_popup = None
         self._claude_api_key  = self._load_claude_api_key()
         self._claude_worker   = None
         self._ai_history      = []   # list of {"role":..., "content":...}
@@ -3816,6 +4018,21 @@ class RobotControlApp(QMainWindow):
         self.editor_deploy_btn.clicked.connect(self._deploy_from_editor)
         top_bar.addWidget(self.editor_deploy_btn)
 
+        # AI button — visible in both Simple and Expert views
+        editor_ai_btn = QPushButton()
+        editor_ai_btn.setFixedSize(34, 34)
+        editor_ai_btn.setIcon(_draw_ai_circle_icon(34))
+        editor_ai_btn.setIconSize(QSize(34, 34))
+        editor_ai_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 17px; }"
+            "QPushButton:hover { background: rgba(255,255,255,20); }"
+            "QPushButton:pressed { background: rgba(255,255,255,40); }"
+        )
+        editor_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        editor_ai_btn.setToolTip("AI Agent")
+        editor_ai_btn.clicked.connect(self._show_ai_popup)
+        top_bar.addWidget(editor_ai_btn)
+
         layout.addLayout(top_bar)
 
         # Stacked widget (Simple View = 0, Full View = 1)
@@ -3946,42 +4163,7 @@ class RobotControlApp(QMainWindow):
             pass
 
     def _make_send_icon(self, size=44):
-        """Draw a white upward-arrow inside a white circle on a transparent background."""
-        scale = 2                          # render at 2× for HiDPI sharpness
-        px = QPixmap(size * scale, size * scale)
-        px.setDevicePixelRatio(scale)
-        px.fill(Qt.GlobalColor.transparent)
-
-        painter = QPainter(px)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        pen = QPen(QColor("white"))
-        pen.setWidthF(2.2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-
-        s = float(size)
-        m = 2.0
-        # Outer circle
-        painter.drawEllipse(QRectF(m, m, s - 2 * m, s - 2 * m))
-
-        cx   = s / 2.0
-        top  = s * 0.27          # arrowhead tip
-        bot  = s * 0.68          # shaft base
-        hw   = s * 0.15          # arrowhead half-width
-        mid  = s * 0.42          # arrowhead shoulder y
-
-        # Shaft
-        painter.drawLine(QPointF(cx, bot), QPointF(cx, top))
-        # Left wing
-        painter.drawLine(QPointF(cx, top), QPointF(cx - hw, mid))
-        # Right wing
-        painter.drawLine(QPointF(cx, top), QPointF(cx + hw, mid))
-
-        painter.end()
-        return QIcon(px)
+        return _draw_send_icon(size)
 
     def _build_ask_ai_tab(self):
         tab = QWidget()
@@ -4164,9 +4346,12 @@ class RobotControlApp(QMainWindow):
 
         # Track conversation history
         self._ai_history.append({"role": "user", "content": prompt})
+        self._last_user_prompt = prompt
 
         self._ask_ai_btn.setEnabled(False)
-        self._claude_worker = _ClaudeWorker(self._claude_api_key, self._ai_history)
+        self._claude_worker = _ClaudeWorker(
+            self._claude_api_key, self._ai_history, _ai_system_prompt()
+        )
         self._claude_worker.token_received.connect(self._on_ai_token)
         self._claude_worker.finished.connect(self._on_ai_finished)
         self._claude_worker.error.connect(self._on_ai_error)
@@ -4184,12 +4369,42 @@ class RobotControlApp(QMainWindow):
     def _on_ai_finished(self):
         self._ai_output.append("\n")
         self._ai_output.moveCursor(QTextCursor.MoveOperation.End)
-        # Save assistant reply to history
         reply = getattr(self, "_ai_response_buffer", "")
         if reply:
             self._ai_history.append({"role": "assistant", "content": reply})
+            self._maybe_create_app_from_response(reply)
         self._ai_response_buffer = ""
         self._ask_ai_btn.setEnabled(True)
+
+    def _maybe_create_app_from_response(self, response):
+        """If the response contains an APP_NAME code block, create the project on disk."""
+        match = re.search(
+            r'```python\s*\n#\s*APP_NAME:\s*(\w+)\s*\n(.*?)```',
+            response, re.DOTALL
+        )
+        if not match:
+            return
+        app_name  = match.group(1).strip()
+        code_body = match.group(2)
+        full_code = f"# APP_NAME: {app_name}\n{code_body}"
+
+        roboapps_dir = os.path.join(_PKG_DIR, "roboapps")
+        app_dir      = os.path.join(roboapps_dir, app_name)
+        script_path  = os.path.join(app_dir, f"{app_name}.py")
+        try:
+            os.makedirs(app_dir, exist_ok=True)
+            with open(script_path, "w") as f:
+                f.write(full_code)
+            self._add_custom_app_to_roboapps(app_name, app_dir)
+            self._ai_output.append(
+                f'<br><span style="color:#30D158;">✓ App <b>{app_name}</b> created and added to RoboApps.<br>'
+                f'<span style="color:#636366;">{script_path}</span></span><br>'
+            )
+        except OSError as e:
+            self._ai_output.append(
+                f'<br><span style="color:#FF453A;">✗ Could not write project files: {e}</span><br>'
+            )
+        self._ai_output.moveCursor(QTextCursor.MoveOperation.End)
 
     def _on_ai_error(self, msg):
         self._ai_output.append(
@@ -4252,6 +4467,35 @@ class RobotControlApp(QMainWindow):
 
         # --- Top bar ---
         top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(8, 4, 8, 4)
+
+        _ra_btn_style = (
+            "QPushButton { font-size: 18px; font-weight: bold;"
+            "  min-width: 30px; max-width: 30px;"
+            "  min-height: 30px; max-height: 30px; border-radius: 15px;"
+            "  background-color: #3A3A3C; color: white; border: none; }"
+            "QPushButton:hover { background-color: #48484A; }"
+            "QPushButton:pressed { background-color: #636366; }"
+            "QPushButton:checked { background-color: #FF3B30; }"
+        )
+
+        ra_add_btn = QPushButton("+")
+        ra_add_btn.setToolTip("Add new app")
+        ra_add_btn.setStyleSheet(_ra_btn_style)
+        ra_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ra_add_btn.clicked.connect(self._on_new_app_clicked)
+        top_bar.addWidget(ra_add_btn)
+
+        top_bar.addSpacing(6)
+
+        self._roboapps_minus_btn = QPushButton("−")
+        self._roboapps_minus_btn.setToolTip("Delete apps (click red ✕ on an icon)")
+        self._roboapps_minus_btn.setCheckable(True)
+        self._roboapps_minus_btn.setStyleSheet(_ra_btn_style)
+        self._roboapps_minus_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._roboapps_minus_btn.clicked.connect(self._toggle_delete_mode)
+        top_bar.addWidget(self._roboapps_minus_btn)
+
         top_bar.addStretch()
 
         roboapps_label = QLabel("RoboApps")
@@ -4261,6 +4505,21 @@ class RobotControlApp(QMainWindow):
         top_bar.addWidget(roboapps_label)
 
         top_bar.addStretch()
+
+        ra_ai_btn = QPushButton()
+        ra_ai_btn.setFixedSize(34, 34)
+        ra_ai_btn.setIcon(_draw_ai_circle_icon(34))
+        ra_ai_btn.setIconSize(QSize(34, 34))
+        ra_ai_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 17px; }"
+            "QPushButton:hover { background: rgba(0,0,0,30); }"
+            "QPushButton:pressed { background: rgba(0,0,0,60); }"
+        )
+        ra_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ra_ai_btn.setToolTip("AI Agent")
+        ra_ai_btn.clicked.connect(self._show_ai_popup)
+        top_bar.addWidget(ra_ai_btn)
+
         layout.addLayout(top_bar)
 
         # --- Main area (white background) ---
@@ -4462,6 +4721,26 @@ class RobotControlApp(QMainWindow):
             tooltip=f"Launch {app_name}",
             click_handler=lambda: self._launch_custom_app(folder_path, main_script),
         )
+
+        # X badge — top-right corner of the 90×90 icon button
+        # Icon button is centred in 108px container: left=9, right=99
+        x_badge = QPushButton("✕", icon_widget)
+        x_badge.setFixedSize(20, 20)
+        x_badge.setStyleSheet(
+            "QPushButton { background: #FF3B30; color: white; border-radius: 10px;"
+            " font-size: 11px; font-weight: bold; border: none; }"
+            "QPushButton:hover { background: #CC2A22; }"
+        )
+        x_badge.move(79, 2)
+        x_badge.raise_()
+        x_badge.setVisible(self._roboapps_delete_mode)
+        x_badge.clicked.connect(
+            lambda _=False, w=icon_widget, n=app_name, p=folder_path:
+                self._delete_custom_app(n, p, w)
+        )
+
+        self._custom_app_widgets.append((icon_widget, x_badge))
+
         # Insert before the trailing stretch
         count = self._roboapps_icons_layout.count()
         self._roboapps_icons_layout.insertWidget(count - 1, icon_widget)
@@ -4485,6 +4764,43 @@ class RobotControlApp(QMainWindow):
             )
         except Exception as e:
             self._log(f"ERROR launching {main_script}: {e}")
+
+    def _toggle_delete_mode(self):
+        """Toggle delete mode: show/hide red X badges on deletable app icons."""
+        self._roboapps_delete_mode = self._roboapps_minus_btn.isChecked()
+        for _, x_badge in self._custom_app_widgets:
+            x_badge.setVisible(self._roboapps_delete_mode)
+
+    def _delete_custom_app(self, app_name, folder_path, widget):
+        """Remove a custom app icon from RoboApps and persist the change."""
+        # Remove tracking entry
+        self._custom_app_widgets = [
+            (w, x) for w, x in self._custom_app_widgets if w is not widget
+        ]
+        self._custom_apps = [
+            (n, p) for n, p in self._custom_apps if p != folder_path
+        ]
+        self._save_custom_apps()
+        # Remove from layout
+        self._roboapps_icons_layout.removeWidget(widget)
+        widget.setParent(None)
+        widget.deleteLater()
+        # Exit delete mode automatically when no more deletable apps
+        if not self._custom_app_widgets:
+            self._roboapps_delete_mode = False
+            self._roboapps_minus_btn.setChecked(False)
+
+    def _show_ai_popup(self):
+        """Show (or raise) the floating AI Agent popup dialog."""
+        if self._ai_popup is None:
+            self._ai_popup = _AIChatDialog(
+                api_key_getter=lambda: self._claude_api_key,
+                on_response_complete=self._maybe_create_app_from_response,
+                parent=self,
+            )
+        self._ai_popup.show()
+        self._ai_popup.raise_()
+        self._ai_popup.activateWindow()
 
     def _show_conda_not_installed_dialog(self):
         """Show the 'Conda not installed' dialog and trigger installation if chosen."""
