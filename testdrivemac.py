@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QScrollArea, QInputDialog, QTreeWidget, QTreeWidgetItem,
     QTreeWidgetItemIterator, QAbstractItemView, QTableWidget, QTableWidgetItem, QHeaderView,
     QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
-    QButtonGroup, QMenu, QRadioButton,
+    QButtonGroup, QMenu, QRadioButton, QFileDialog,
 )
 from PyQt6.QtCore import (
     QThread, pyqtSignal, QRegularExpression, Qt, QSize, QRect,
@@ -2313,6 +2313,7 @@ class RobotControlApp(QMainWindow):
         self._rviz_helpers = []   # helper processes started alongside RViz
         self._gazebo_process = None
         self._robosim_process = None
+        self._custom_apps = []  # list of (app_name, folder_path) tuples
         self._sim_dialog = None
         self._syncing = False
         self._full_view_current_file = None
@@ -3864,6 +3865,49 @@ class RobotControlApp(QMainWindow):
     #  Tab 4: RoboApps                                                     #
     # ------------------------------------------------------------------ #
 
+    def _make_app_icon_widget(self, symbol, label_text, bg_color, hover_color,
+                              pressed_color, text_color, tooltip, click_handler):
+        """Return an iOS-style app icon widget: square button + name label below."""
+        container = QWidget()
+        container.setFixedWidth(108)
+        vbox = QVBoxLayout(container)
+        vbox.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(7)
+
+        btn = QPushButton(symbol)
+        btn.setFixedSize(90, 90)
+        btn.setStyleSheet(
+            f"QPushButton {{"
+            f"  background-color: {bg_color};"
+            f"  color: {text_color};"
+            f"  font-size: 38px;"
+            f"  border-radius: 20px;"
+            f"  border: none;"
+            f"}}"
+            f"QPushButton:hover {{"
+            f"  background-color: {hover_color};"
+            f"}}"
+            f"QPushButton:pressed {{"
+            f"  background-color: {pressed_color};"
+            f"}}"
+        )
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(tooltip)
+        btn.clicked.connect(click_handler)
+
+        lbl = QLabel(label_text)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        lbl.setFixedWidth(108)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(
+            "color: #1C1C1E; background: transparent; font-size: 11px;"
+        )
+
+        vbox.addWidget(btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        vbox.addWidget(lbl, 0, Qt.AlignmentFlag.AlignHCenter)
+        return container, btn
+
     def _build_roboapps_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -3896,29 +3940,31 @@ class RobotControlApp(QMainWindow):
         self._roboapps_icons_layout.setSpacing(16)
         self._roboapps_icons_layout.setContentsMargins(0, 0, 0, 0)
 
-        # RoboSim app icon (iPhone-style)
-        robosim_btn = QPushButton("RoboSim")
-        robosim_btn.setFixedSize(120, 120)
-        robosim_btn.setStyleSheet(
-            "QPushButton {"
-            "  background-color: #007AFF;"
-            "  color: white;"
-            "  font-size: 16px;"
-            "  font-weight: bold;"
-            "  border-radius: 27px;"
-            "  border: none;"
-            "}"
-            "QPushButton:hover {"
-            "  background-color: #005ECB;"
-            "}"
-            "QPushButton:pressed {"
-            "  background-color: #004AAD;"
-            "}"
+        # "New App" (+) button — appears first, before RoboSim
+        new_app_widget, _ = self._make_app_icon_widget(
+            symbol="+",
+            label_text="New App",
+            bg_color="#E5E5EA",
+            hover_color="#D1D1D6",
+            pressed_color="#C7C7CC",
+            text_color="#3A3A3C",
+            tooltip="Add a new app",
+            click_handler=self._on_new_app_clicked,
         )
-        robosim_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        robosim_btn.setToolTip("Launch RoboSim5")
-        robosim_btn.clicked.connect(self._launch_robosim)
-        self._roboapps_icons_layout.addWidget(robosim_btn)
+        self._roboapps_icons_layout.addWidget(new_app_widget)
+
+        # RoboSim app icon (iPhone-style)
+        robosim_widget, _ = self._make_app_icon_widget(
+            symbol="▷",
+            label_text="RoboSim",
+            bg_color="#007AFF",
+            hover_color="#005ECB",
+            pressed_color="#004AAD",
+            text_color="white",
+            tooltip="Launch RoboSim5",
+            click_handler=self._launch_robosim,
+        )
+        self._roboapps_icons_layout.addWidget(robosim_widget)
         self._roboapps_icons_layout.addStretch()
 
         main_area_layout.addWidget(icons_container)
@@ -3961,30 +4007,19 @@ class RobotControlApp(QMainWindow):
         if self._conda_icon_added:
             return
         self._conda_icon_added = True
-        conda_btn = QPushButton("Conda")
-        conda_btn.setFixedSize(120, 120)
-        conda_btn.setStyleSheet(
-            "QPushButton {"
-            "  background-color: #34C759;"
-            "  color: white;"
-            "  font-size: 16px;"
-            "  font-weight: bold;"
-            "  border-radius: 27px;"
-            "  border: none;"
-            "}"
-            "QPushButton:hover {"
-            "  background-color: #248A3D;"
-            "}"
-            "QPushButton:pressed {"
-            "  background-color: #1A6B2F;"
-            "}"
+        conda_widget, _ = self._make_app_icon_widget(
+            symbol="py",
+            label_text="Conda",
+            bg_color="#34C759",
+            hover_color="#248A3D",
+            pressed_color="#1A6B2F",
+            text_color="white",
+            tooltip="Conda environment manager for ROS2",
+            click_handler=self._on_conda_icon_clicked,
         )
-        conda_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        conda_btn.setToolTip("Conda environment manager for ROS2")
-        conda_btn.clicked.connect(self._on_conda_icon_clicked)
         # Insert before the trailing stretch
         count = self._roboapps_icons_layout.count()
-        self._roboapps_icons_layout.insertWidget(count - 1, conda_btn)
+        self._roboapps_icons_layout.insertWidget(count - 1, conda_widget)
 
     def _on_conda_icon_clicked(self):
         """Show brief Conda info when the RoboApps Conda icon is clicked."""
@@ -3997,6 +4032,80 @@ class RobotControlApp(QMainWindow):
                 "Run  bash setup_robostack.sh  in the project folder to set it up."
             )
         QMessageBox.information(self, "Conda", msg)
+
+    # ------------------------------------------------------------------ #
+    #  New App — custom app creation                                       #
+    # ------------------------------------------------------------------ #
+
+    def _on_new_app_clicked(self):
+        """Show instruction, then open a folder picker to create a new app icon."""
+        # Step 1: instruction dialog (simple QMessageBox — no nested event loops)
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Create a New App")
+        msg.setText("Select a project folder containing your Python app.")
+        msg.setStandardButtons(
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+        )
+        msg.setDefaultButton(QMessageBox.StandardButton.Ok)
+        if msg.exec() != QMessageBox.StandardButton.Ok:
+            return
+
+        # Step 2: native folder picker — runs directly on the main window (no nesting)
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Project Folder",
+            os.path.expanduser("~"),
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if folder:
+            app_name = os.path.basename(folder)
+            self._add_custom_app_to_roboapps(app_name, folder)
+
+    def _add_custom_app_to_roboapps(self, app_name, folder_path):
+        """Add a custom app icon to the RoboApps tab."""
+        self._custom_apps.append((app_name, folder_path))
+        # Pick the main Python script (alphabetically first .py file)
+        try:
+            py_files = sorted(
+                f for f in os.listdir(folder_path) if f.endswith(".py")
+            )
+            main_script = py_files[0] if py_files else None
+        except OSError:
+            main_script = None
+
+        icon_widget, _ = self._make_app_icon_widget(
+            symbol="",
+            label_text=app_name,
+            bg_color="#FF9500",
+            hover_color="#CC7700",
+            pressed_color="#AA6200",
+            text_color="white",
+            tooltip=f"Launch {app_name}",
+            click_handler=lambda: self._launch_custom_app(folder_path, main_script),
+        )
+        # Insert before the trailing stretch
+        count = self._roboapps_icons_layout.count()
+        self._roboapps_icons_layout.insertWidget(count - 1, icon_widget)
+
+    def _launch_custom_app(self, folder_path, main_script):
+        """Launch a custom app locally using TestDrive's Python interpreter."""
+        app_name = os.path.basename(folder_path) or "App"
+        if not main_script:
+            QMessageBox.warning(
+                self, app_name,
+                f"No Python script found in:\n{folder_path}"
+            )
+            return
+        script_path = os.path.join(folder_path, main_script)
+        self._log(f"Launching custom app: {script_path}")
+        try:
+            subprocess.Popen(
+                [sys.executable, script_path],
+                cwd=folder_path,
+                start_new_session=True,
+            )
+        except Exception as e:
+            self._log(f"ERROR launching {main_script}: {e}")
 
     def _show_conda_not_installed_dialog(self):
         """Show the 'Conda not installed' dialog and trigger installation if chosen."""
