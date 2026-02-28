@@ -18,11 +18,11 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QDoubleSpinBox, QComboBox, QPushButton, QTextEdit,
     QGroupBox, QGridLayout, QLineEdit, QMessageBox,
-    QTabWidget, QPlainTextEdit, QStackedWidget, QListWidget,
+    QTabWidget, QPlainTextEdit, QStackedWidget, QListWidget, QListWidgetItem,
     QSplitter, QScrollArea, QInputDialog, QTreeWidget, QTreeWidgetItem,
     QTreeWidgetItemIterator, QAbstractItemView, QTableWidget, QTableWidgetItem, QHeaderView,
     QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
-    QButtonGroup, QMenu, QRadioButton, QFileDialog,
+    QButtonGroup, QMenu, QRadioButton, QFileDialog, QListView,
 )
 from PyQt6.QtCore import (
     QThread, pyqtSignal, QRegularExpression, Qt, QSize, QRect,
@@ -798,6 +798,29 @@ def _draw_ai_circle_icon(size=36):
     return QIcon(px)
 
 
+def _draw_search_icon(size=22, color="white"):
+    """Magnifier glass icon on transparent background."""
+    scale = 2
+    px = QPixmap(size * scale, size * scale)
+    px.setDevicePixelRatio(scale)
+    px.fill(Qt.GlobalColor.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), 1.8, Qt.PenStyle.SolidLine,
+               Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    s = float(size)
+    r  = s * 0.30
+    cx = s * 0.40
+    cy = s * 0.40
+    p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
+    p.drawLine(QPointF(cx + r * 0.72, cy + r * 0.72),
+               QPointF(s * 0.86, s * 0.86))
+    p.end()
+    return QIcon(px)
+
+
 def _ai_system_prompt():
     roboapps_dir = os.path.join(_PKG_DIR, "roboapps")
     return (
@@ -817,17 +840,21 @@ def _ai_system_prompt():
 
 
 class _AIChatDialog(QDialog):
-    """Floating AI chat dialog — same functionality as the AI Agent tab."""
+    """Floating AI chat dialog with file context support for Expert View debugging."""
 
-    def __init__(self, api_key_getter, on_response_complete=None, parent=None):
+    def __init__(self, api_key_getter, api_key_dialog_cb=None,
+                 on_response_complete=None, parent=None):
         super().__init__(parent)
-        self._get_key = api_key_getter
-        self._on_complete = on_response_complete
-        self._history = []
-        self._worker  = None
-        self._buffer  = ""
+        self._get_key          = api_key_getter
+        self._api_key_dialog_cb = api_key_dialog_cb
+        self._on_complete      = on_response_complete
+        self._history          = []
+        self._worker           = None
+        self._buffer           = ""
+        self._pending_context  = None   # (filename, content) injected on next send
+        self._output_font_size = 13     # adjustable via A buttons
         self.setWindowTitle("AI Agent")
-        self.resize(700, 520)
+        self.resize(700, 560)
         self.setStyleSheet("background-color: #1E1E1E;")
         self._build_ui()
 
@@ -836,6 +863,102 @@ class _AIChatDialog(QDialog):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        # Top bar: [API Key] ··· [small A] [big A] [search]
+        top_bar = QWidget()
+        top_bar.setStyleSheet("background-color: #2C2C2E; border-bottom: 1px solid #3A3A3C;")
+        top_bar.setFixedHeight(44)
+        tb = QHBoxLayout(top_bar)
+        tb.setContentsMargins(12, 0, 12, 0)
+        tb.setSpacing(4)
+        if self._api_key_dialog_cb:
+            api_key_btn = QPushButton("API Key")
+            api_key_btn.setFixedHeight(28)
+            api_key_btn.setStyleSheet(
+                "QPushButton { background: #3A3A3C; color: #EBEBF5; border-radius: 7px;"
+                " padding: 0 12px; font-size: 12px; border: none; }"
+                "QPushButton:hover { background: #48484A; }"
+                "QPushButton:pressed { background: #636366; }"
+            )
+            api_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            api_key_btn.clicked.connect(self._api_key_dialog_cb)
+            tb.addWidget(api_key_btn)
+        tb.addStretch()
+
+        _icon_btn_style = (
+            "QPushButton { background: transparent; color: #EBEBF5; border: none;"
+            " border-radius: 6px; }"
+            "QPushButton:hover { background: rgba(255,255,255,18); }"
+            "QPushButton:pressed { background: rgba(255,255,255,35); }"
+        )
+
+        # Small A — decrease font
+        small_a = QPushButton("A")
+        small_a.setFixedSize(28, 28)
+        _sa_font = QFont("Helvetica Neue", 10)
+        small_a.setFont(_sa_font)
+        small_a.setStyleSheet(_icon_btn_style)
+        small_a.setCursor(Qt.CursorShape.PointingHandCursor)
+        small_a.setToolTip("Decrease font size")
+        small_a.clicked.connect(lambda: self._change_font_size(-1))
+        tb.addWidget(small_a)
+
+        # Big A — increase font
+        big_a = QPushButton("A")
+        big_a.setFixedSize(28, 28)
+        _ba_font = QFont("Helvetica Neue", 16)
+        _ba_font.setBold(True)
+        big_a.setFont(_ba_font)
+        big_a.setStyleSheet(_icon_btn_style)
+        big_a.setCursor(Qt.CursorShape.PointingHandCursor)
+        big_a.setToolTip("Increase font size")
+        big_a.clicked.connect(lambda: self._change_font_size(+1))
+        tb.addWidget(big_a)
+
+        tb.addSpacing(6)
+
+        # Search — magnifier icon, rightmost
+        search_btn = QPushButton()
+        search_btn.setFixedSize(28, 28)
+        search_btn.setIcon(_draw_search_icon(22))
+        search_btn.setIconSize(QSize(22, 22))
+        search_btn.setStyleSheet(_icon_btn_style)
+        search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        search_btn.setToolTip("Search output  (⌘F)")
+        search_btn.clicked.connect(self._toggle_ai_search)
+        tb.addWidget(search_btn)
+
+        outer.addWidget(top_bar)
+
+        # Search bar (hidden until search button is pressed)
+        self._ai_search_bar = QWidget()
+        self._ai_search_bar.setStyleSheet(
+            "background: #252528; border-bottom: 1px solid #3A3A3C;"
+        )
+        self._ai_search_bar.setFixedHeight(36)
+        sb_row = QHBoxLayout(self._ai_search_bar)
+        sb_row.setContentsMargins(10, 4, 10, 4)
+        sb_row.setSpacing(6)
+        self._ai_search_input = QLineEdit()
+        self._ai_search_input.setPlaceholderText("Search…")
+        self._ai_search_input.setStyleSheet(
+            "QLineEdit { background: #3A3A3C; color: #F0F0F0;"
+            " border: 1px solid #48484A; border-radius: 6px;"
+            " padding: 2px 8px; font-size: 12px; }"
+        )
+        self._ai_search_input.textChanged.connect(self._ai_search_changed)
+        sb_row.addWidget(self._ai_search_input)
+        sb_close = QPushButton("✕")
+        sb_close.setFixedSize(22, 22)
+        sb_close.setStyleSheet(
+            "QPushButton { background: transparent; color: #8E8E93; border: none; font-size: 13px; }"
+            "QPushButton:hover { color: #FF453A; }"
+        )
+        sb_close.clicked.connect(self._toggle_ai_search)
+        sb_row.addWidget(sb_close)
+        self._ai_search_bar.hide()
+        outer.addWidget(self._ai_search_bar)
+
+        # Output area — expands to fill all available space
         self._output = QTextEdit()
         self._output.setReadOnly(True)
         self._output.setStyleSheet(
@@ -845,24 +968,28 @@ class _AIChatDialog(QDialog):
         mono = QFont("Menlo", 13)
         mono.setFixedPitch(True)
         self._output.setFont(mono)
-        outer.addWidget(self._output, 7)
+        outer.addWidget(self._output, 1)
 
+        # Prompt row: [margin | input box | send btn (outside) | margin]
         prompt_row = QWidget()
         prompt_row.setStyleSheet("background: transparent;")
         pr = QHBoxLayout(prompt_row)
         pr.setContentsMargins(0, 0, 0, 0)
-        pr.setSpacing(0)
+        pr.setSpacing(10)
+
+        pr.addStretch(1)   # ~10% left margin
 
         box = QWidget()
         box.setStyleSheet("background-color: #2C2C2E; border-radius: 12px;")
         pl = QHBoxLayout(box)
-        pl.setContentsMargins(12, 12, 12, 12)
-        pl.setSpacing(10)
+        pl.setContentsMargins(12, 10, 12, 10)
+        pl.setSpacing(0)
 
         self._input = QPlainTextEdit()
         self._input.setPlaceholderText(
             "I can help you to generate code, create an app or debug your project."
         )
+        self._input.setFixedHeight(76)
         self._input.setStyleSheet(
             "QPlainTextEdit { background-color: #3A3A3C; color: #F0F0F0;"
             " border: 1px solid #48484A; border-radius: 10px;"
@@ -871,8 +998,12 @@ class _AIChatDialog(QDialog):
         mono2 = QFont("Menlo", 13)
         mono2.setFixedPitch(True)
         self._input.setFont(mono2)
-        pl.addWidget(self._input, 1)
+        self._input.installEventFilter(self)   # Enter key → send
+        pl.addWidget(self._input)
 
+        pr.addWidget(box, 8)   # ~80% width for the input box
+
+        # Send button lives OUTSIDE the dark box, right of it
         self._send_btn = QPushButton()
         self._send_btn.setFixedSize(44, 44)
         self._send_btn.setIcon(_draw_send_icon(44))
@@ -885,12 +1016,78 @@ class _AIChatDialog(QDialog):
         )
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._send_btn.clicked.connect(self._send)
-        pl.addWidget(self._send_btn)
+        pr.addWidget(self._send_btn)
 
-        pr.addStretch(1)
-        pr.addWidget(box, 8)
-        pr.addStretch(1)
-        outer.addWidget(prompt_row, 3)
+        pr.addStretch(1)   # ~10% right margin (send btn sits just outside the box edge)
+
+        outer.addWidget(prompt_row)
+
+        # Fixed bottom gap — ~5 cm clearance from window edge
+        outer.addSpacing(45)
+
+    def eventFilter(self, obj, event):
+        """Send on Enter; Shift+Enter inserts a newline."""
+        if obj is self._input and event.type() == event.Type.KeyPress:
+            if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                    and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
+                self._send()
+                return True
+        return super().eventFilter(obj, event)
+
+    # -- font size ----------------------------------------------------------
+
+    def _change_font_size(self, delta):
+        self._output_font_size = max(8, min(26, self._output_font_size + delta))
+        font = self._output.font()
+        font.setPointSize(self._output_font_size)
+        self._output.setFont(font)
+
+    # -- search -------------------------------------------------------------
+
+    def _toggle_ai_search(self):
+        visible = self._ai_search_bar.isVisible()
+        self._ai_search_bar.setVisible(not visible)
+        if visible:
+            self._ai_search_input.clear()
+            self._output.setExtraSelections([])
+        else:
+            self._ai_search_input.setFocus()
+            self._ai_search_input.selectAll()
+
+    def _ai_search_changed(self, text):
+        self._output.setExtraSelections([])
+        if not text:
+            return
+        selections = []
+        doc = self._output.document()
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor("#FFE082"))
+        fmt.setForeground(QColor("#1A1A1A"))
+        cursor = QTextCursor(doc)
+        while True:
+            cursor = doc.find(text, cursor)
+            if cursor.isNull():
+                break
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = cursor
+            sel.format = fmt
+            selections.append(sel)
+        self._output.setExtraSelections(selections)
+        # Scroll to first match
+        if selections:
+            self._output.setTextCursor(selections[0].cursor)
+            self._output.ensureCursorVisible()
+
+    def set_file_context(self, filename, content):
+        """Inject the given file as context — prepended to the user's next message."""
+        self._pending_context = (filename, content)
+        self._history = []   # fresh conversation for new file context
+        self._output.clear()
+        self._output.append(
+            f'<span style="color:#636366; font-size:11px;">📄 Context loaded: '
+            f'<b style="color:#EBEBF5;">{filename}</b> — ask me to debug or explain it.</span><br>'
+        )
+        self._output.moveCursor(QTextCursor.MoveOperation.End)
 
     def _send(self):
         prompt = self._input.toPlainText().strip()
@@ -899,11 +1096,21 @@ class _AIChatDialog(QDialog):
         key = self._get_key()
         if not key:
             self._output.append(
-                '<span style="color:#FF453A;">⚠ No API key — set it in the AI Agent tab.</span>'
+                '<span style="color:#FF453A;">⚠ No API key — click <b>API Key</b> to add your Claude API key.</span>'
             )
             return
         if self._worker and self._worker.isRunning():
             return
+
+        # Prepend pending file context to the first message
+        effective_prompt = prompt
+        if self._pending_context:
+            fname, content = self._pending_context
+            self._pending_context = None
+            effective_prompt = (
+                f"Here is the current file '{fname}':\n\n```python\n{content}\n```\n\n{prompt}"
+            )
+
         self._input.clear()
         self._output.append(
             f'<span style="color:#30D158;font-weight:bold;">▶ You</span>'
@@ -912,7 +1119,7 @@ class _AIChatDialog(QDialog):
         self._output.append('<span style="color:#636366;">─────────────────────</span>')
         self._output.append('<span style="color:#0A84FF;font-weight:bold;">Claude</span><br>')
         self._output.moveCursor(QTextCursor.MoveOperation.End)
-        self._history.append({"role": "user", "content": prompt})
+        self._history.append({"role": "user", "content": effective_prompt})
         self._send_btn.setEnabled(False)
         self._worker = _ClaudeWorker(key, self._history, _ai_system_prompt())
         self._worker.token_received.connect(self._on_token)
@@ -944,6 +1151,431 @@ class _AIChatDialog(QDialog):
         self._output.moveCursor(QTextCursor.MoveOperation.End)
         self._buffer = ""
         self._send_btn.setEnabled(True)
+
+
+class _SeqListWidget(QListWidget):
+    """Horizontal drag-to-reorder list — avoids the PyQt6 InternalMove+LeftToRight crash.
+    Long-press an item to reveal a red × badge for removal.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFlow(QListView.Flow.LeftToRight)
+        self.setWrapping(False)
+        self.setSpacing(6)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        # Use DragDrop (not InternalMove) so we handle reorder in dropEvent ourselves
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+        # Long-press detection
+        self._lp_timer = QTimer(self)
+        self._lp_timer.setSingleShot(True)
+        self._lp_timer.setInterval(500)
+        self._lp_timer.timeout.connect(self._show_delete_badge)
+        self._lp_item  = None
+        self._lp_start = None
+        self._badges   = []  # list of (QPushButton, QListWidgetItem)
+
+    # ── drag & drop ──────────────────────────────────────────────────────────
+
+    def dropEvent(self, event):
+        if event.source() is not self:
+            event.ignore()
+            return
+        # Set CopyAction so Qt's post-drag clearOrRemove() never fires.
+        # (clearOrRemove fires only when exec() returns MoveAction; our manual
+        # takeItem/insertItem already handles the reorder correctly.)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        dragged = self.selectedItems()
+        if not dragged:
+            return
+        dragged_item = dragged[0]
+        target = self.itemAt(event.position().toPoint())
+        if target is None or target is dragged_item:
+            return  # dropped in empty space or on itself — keep original position
+
+        dragged_row = self.row(dragged_item)
+        target_row  = self.row(target)
+
+        # After takeItem(dragged_row), items at indices > dragged_row shift left by 1.
+        # Compensate so the dropped item lands at the target's original visual slot.
+        if dragged_row < target_row:
+            target_row -= 1
+        if dragged_row == target_row:
+            return
+
+        text      = dragged_item.text()
+        user_data = dragged_item.data(Qt.ItemDataRole.UserRole)
+        size_hint = dragged_item.sizeHint()
+        self.takeItem(dragged_row)
+        new_item = QListWidgetItem(text)
+        new_item.setData(Qt.ItemDataRole.UserRole, user_data)
+        new_item.setSizeHint(size_hint)
+        self.insertItem(target_row, new_item)
+        self.setCurrentItem(new_item)
+        self._clear_badges()  # badges reference old item objects; discard after reorder
+
+    # ── long-press badge ─────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            # Dismiss badges when the click doesn't land on a badge button
+            if not self._badge_at(pos):
+                self._clear_badges()
+            item = self.itemAt(pos)
+            if item:
+                self._lp_item  = item
+                self._lp_start = pos
+                self._lp_timer.start()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._lp_timer.isActive() and self._lp_start is not None:
+            if (event.position().toPoint() - self._lp_start).manhattanLength() > 8:
+                self._lp_timer.stop()
+                self._lp_item = None
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._lp_timer.stop()
+        super().mouseReleaseEvent(event)
+
+    def _badge_at(self, viewport_pos):
+        """Return the badge button whose geometry contains viewport_pos, or None."""
+        for badge, _ in self._badges:
+            if badge.geometry().contains(viewport_pos):
+                return badge
+        return None
+
+    def _clear_badges(self):
+        for badge, _ in self._badges:
+            badge.deleteLater()
+        self._badges.clear()
+
+    def _show_delete_badge(self):
+        item = self._lp_item
+        if item is None or self.row(item) < 0:
+            return
+        # Don't create a duplicate badge for the same item
+        for _, existing in self._badges:
+            if existing is item:
+                return
+        rect  = self.visualItemRect(item)
+        badge = QPushButton("✕", self.viewport())
+        badge.setFixedSize(20, 20)
+        badge.move(rect.right() - 10, rect.top() - 10)
+        badge.setStyleSheet(
+            "QPushButton { background: #FF3B30; color: white; border-radius: 10px;"
+            "  font-size: 11px; font-weight: bold; border: none; }"
+            "QPushButton:hover { background: #CC2F25; }"
+            "QPushButton:pressed { background: #AA2820; }"
+        )
+        badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        badge.show()
+        badge.raise_()
+        self._badges.append((badge, item))
+        badge.clicked.connect(
+            lambda _=False, i=item, b=badge: self._remove_badged_item(i, b)
+        )
+
+    def _remove_badged_item(self, item, badge):
+        self._badges = [(b, i) for b, i in self._badges if b is not badge]
+        badge.deleteLater()
+        row = self.row(item)
+        if row >= 0:
+            self.takeItem(row)
+
+
+class _LaunchPadDialog(QDialog):
+    """Popup for sequencing and launching multiple RoboApps in order."""
+
+    _LAUNCHPAD_SEQ_FILE = os.path.expanduser("~/.testdrive_launchpad_seq.json")
+
+    def __init__(self, apps, ssh_connected_cb, launch_cb, parent=None):
+        """
+        apps            : list of (name, folder_path)
+        ssh_connected_cb: callable() -> bool
+        launch_cb       : callable(folder_path, main_script)
+        """
+        super().__init__(parent)
+        self._apps           = apps
+        self._ssh_connected  = ssh_connected_cb
+        self._launch_cb      = launch_cb
+        self.setWindowTitle("Launch Pad")
+        self.resize(700, 530)
+        self.setStyleSheet("background-color: #1E1E1E;")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+        self._build_ui()
+        self._load_sequence()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(22, 18, 22, 22)
+        outer.setSpacing(10)
+
+        # ── Header row: instruction + search button ───────────────────────────
+        header_row = QHBoxLayout()
+        header_row.setSpacing(6)
+
+        instr = QLabel(
+            "Drag your apps into Launch Pad and place them in sequence from left to right.\n"
+            "Click an app below to add it to the sequence. Then click Launch.\n"
+            "Long-press any app in the sequence to reveal a red × button to remove it."
+        )
+        instr.setStyleSheet("color: #8E8E93; font-size: 12px;")
+        instr.setWordWrap(True)
+        header_row.addWidget(instr, 1)
+
+        self._lp_search_btn = QPushButton()
+        self._lp_search_btn.setFixedSize(36, 36)
+        self._lp_search_btn.setIcon(_draw_search_icon(20, "white"))
+        self._lp_search_btn.setIconSize(QSize(20, 20))
+        self._lp_search_btn.setToolTip("Search apps")
+        self._lp_search_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 18px; }"
+            "QPushButton:hover { background: rgba(255,255,255,18); }"
+            "QPushButton:pressed { background: rgba(255,255,255,35); }"
+        )
+        self._lp_search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._lp_search_btn.clicked.connect(self._lp_toggle_search)
+        header_row.addWidget(self._lp_search_btn, 0, Qt.AlignmentFlag.AlignTop)
+
+        outer.addLayout(header_row)
+
+        # Search bar (hidden until toggled)
+        self._lp_search_bar = QWidget()
+        sb_layout = QHBoxLayout(self._lp_search_bar)
+        sb_layout.setContentsMargins(0, 0, 0, 0)
+        self._lp_search_input = QLineEdit()
+        self._lp_search_input.setPlaceholderText("Search apps by name…")
+        self._lp_search_input.setStyleSheet(
+            "QLineEdit { background: #2C2C2E; color: #EBEBF5; border: 1px solid #3A3A3C;"
+            "  border-radius: 8px; padding: 5px 10px; font-size: 13px; }"
+            "QLineEdit:focus { border-color: #007AFF; }"
+        )
+        self._lp_search_input.textChanged.connect(self._lp_search_changed)
+        sb_layout.addWidget(self._lp_search_input)
+        self._lp_search_bar.hide()
+        outer.addWidget(self._lp_search_bar)
+
+        # ── Sequence ─────────────────────────────────────────────────────────
+        seq_label = QLabel("Sequence")
+        seq_label.setStyleSheet(
+            "color: #EBEBF5; font-size: 12px; font-weight: bold; margin-top: 4px;"
+        )
+        outer.addWidget(seq_label)
+
+        self._seq_list = _SeqListWidget()
+        self._seq_list.setFixedHeight(112)
+        self._seq_list.setStyleSheet(
+            "QListWidget {"
+            "  background: #2C2C2E; border: 1px solid #3A3A3C; border-radius: 12px;"
+            "  padding: 8px; }"
+            "QListWidget::item {"
+            "  background: #007AFF; border-radius: 10px; padding: 6px 16px;"
+            "  margin: 2px; color: white; font-size: 12px; font-weight: bold; }"
+            "QListWidget::item:selected { background: #005ECB; }"
+        )
+        outer.addWidget(self._seq_list)
+
+        hint = QLabel("← Drag items to reorder  ·  Select and press Delete to remove")
+        hint.setStyleSheet("color: #48484A; font-size: 11px;")
+        outer.addWidget(hint)
+
+        # ── Available Apps ────────────────────────────────────────────────────
+        avail_label = QLabel("Available Apps  —  click to add to sequence")
+        avail_label.setStyleSheet(
+            "color: #EBEBF5; font-size: 12px; font-weight: bold; margin-top: 4px;"
+        )
+        outer.addWidget(avail_label)
+
+        avail_scroll = QScrollArea()
+        avail_scroll.setWidgetResizable(True)
+        avail_scroll.setFixedHeight(114)
+        avail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        avail_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        avail_scroll.setStyleSheet(
+            "QScrollArea { background: #2C2C2E; border: 1px solid #3A3A3C;"
+            "  border-radius: 12px; }"
+            "QScrollBar:horizontal { height: 5px; background: #3A3A3C;"
+            "  border-radius: 2px; margin: 0; }"
+            "QScrollBar::handle:horizontal { background: #636366; border-radius: 2px; }"
+            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }"
+        )
+
+        avail_inner = QWidget()
+        avail_inner.setStyleSheet("background: transparent;")
+        avail_row = QHBoxLayout(avail_inner)
+        avail_row.setContentsMargins(12, 10, 12, 10)
+        avail_row.setSpacing(12)
+
+        self._avail_chips = []  # (QPushButton, name, folder_path) for search filtering
+        if self._apps:
+            for name, folder_path in self._apps:
+                chip = QPushButton(name)
+                chip.setFixedSize(84, 76)
+                chip.setStyleSheet(
+                    "QPushButton { background: #FF9500; color: white; border-radius: 12px;"
+                    "  font-size: 11px; font-weight: bold; padding: 4px 8px; border: none; }"
+                    "QPushButton:hover { background: #CC7700; }"
+                    "QPushButton:pressed { background: #AA6200; }"
+                )
+                chip.setCursor(Qt.CursorShape.PointingHandCursor)
+                chip.setToolTip(f"Add {name} to sequence")
+                chip.clicked.connect(
+                    lambda _=False, n=name, fp=folder_path: self._add_app(n, fp)
+                )
+                avail_row.addWidget(chip)
+                self._avail_chips.append((chip, name, folder_path))
+        else:
+            no_apps_lbl = QLabel(
+                "No custom apps yet — add apps in the RoboApps tab first."
+            )
+            no_apps_lbl.setStyleSheet("color: #636366; font-size: 12px;")
+            avail_row.addWidget(no_apps_lbl)
+
+        avail_row.addStretch()
+        avail_scroll.setWidget(avail_inner)
+        outer.addWidget(avail_scroll)
+
+        outer.addStretch()
+
+        # ── Bottom bar ────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+
+        clear_btn = QPushButton("Clear All")
+        clear_btn.setFixedHeight(40)
+        clear_btn.setStyleSheet(
+            "QPushButton { background: #3A3A3C; color: #EBEBF5; border-radius: 10px;"
+            "  padding: 0 22px; font-size: 13px; border: none; }"
+            "QPushButton:hover { background: #48484A; }"
+            "QPushButton:pressed { background: #636366; }"
+        )
+        clear_btn.clicked.connect(self._seq_list.clear)
+
+        launch_btn = QPushButton("Launch")
+        launch_btn.setFixedSize(150, 42)
+        launch_btn.setStyleSheet(
+            "QPushButton { background: #007AFF; color: white; border-radius: 10px;"
+            "  font-size: 15px; font-weight: bold; border: none; }"
+            "QPushButton:hover { background: #005ECB; }"
+            "QPushButton:pressed { background: #004AAD; }"
+        )
+        launch_btn.clicked.connect(self._on_launch)
+
+        btn_row.addWidget(clear_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(launch_btn)
+        outer.addLayout(btn_row)
+
+    # ── search ───────────────────────────────────────────────────────────────
+
+    def _lp_toggle_search(self):
+        visible = self._lp_search_bar.isVisible()
+        self._lp_search_bar.setVisible(not visible)
+        if visible:
+            self._lp_search_input.clear()
+        else:
+            self._lp_search_input.setFocus()
+            self._lp_search_input.selectAll()
+
+    def _lp_search_changed(self, text):
+        term = text.lower().strip()
+        for chip, name, _ in self._avail_chips:
+            chip.setVisible(not term or term in name.lower())
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    def _load_sequence(self):
+        """Restore the last saved sequence, skipping any apps no longer available."""
+        try:
+            with open(self._LAUNCHPAD_SEQ_FILE, "r") as f:
+                saved = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        valid_paths = {fp for _, fp in self._apps}
+        for entry in saved:
+            if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+                continue
+            name, folder_path = entry
+            if folder_path in valid_paths:
+                self._add_app(name, folder_path)
+
+    def _save_sequence(self):
+        """Persist the current sequence to disk."""
+        seq = []
+        for i in range(self._seq_list.count()):
+            item = self._seq_list.item(i)
+            seq.append([item.text(), item.data(Qt.ItemDataRole.UserRole)])
+        try:
+            with open(self._LAUNCHPAD_SEQ_FILE, "w") as f:
+                json.dump(seq, f, indent=2)
+        except OSError:
+            pass
+
+    def closeEvent(self, event):
+        self._save_sequence()
+        super().closeEvent(event)
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _add_app(self, name, folder_path):
+        item = QListWidgetItem(name)
+        item.setData(Qt.ItemDataRole.UserRole, folder_path)
+        item.setSizeHint(QSize(120, 72))
+        self._seq_list.addItem(item)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            for item in self._seq_list.selectedItems():
+                self._seq_list.takeItem(self._seq_list.row(item))
+        else:
+            super().keyPressEvent(event)
+
+    def _on_launch(self):
+        count = self._seq_list.count()
+        if count == 0:
+            QMessageBox.information(
+                self, "Launch Pad",
+                "Add at least one app to the sequence first."
+            )
+            return
+
+        # SSH warning if robot not connected
+        if not self._ssh_connected():
+            reply = QMessageBox.warning(
+                self,
+                "Robot Not Connected",
+                "One or more apps in your sequence may require an SSH connection "
+                "to the robot.\n\n"
+                "Please click <b>Connect</b> in the Robot Control tab before launching.\n\n"
+                "Launch anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        # Launch each app in sequence order
+        for i in range(count):
+            item = self._seq_list.item(i)
+            folder_path = item.data(Qt.ItemDataRole.UserRole)
+            if folder_path:
+                try:
+                    py_files = sorted(
+                        f for f in os.listdir(folder_path) if f.endswith(".py")
+                    )
+                    main_script = py_files[0] if py_files else None
+                except OSError:
+                    main_script = None
+                self._launch_cb(folder_path, main_script)
+
+        self.accept()
 
 
 class _ClaudeWorker(QThread):
@@ -2576,8 +3208,6 @@ class RobotControlApp(QMainWindow):
         self._roboapps_delete_mode = False
         self._ai_popup = None
         self._claude_api_key  = self._load_claude_api_key()
-        self._claude_worker   = None
-        self._ai_history      = []   # list of {"role":..., "content":...}
         self._sim_dialog = None
         self._syncing = False
         self._full_view_current_file = None
@@ -2639,7 +3269,6 @@ class RobotControlApp(QMainWindow):
         self._build_robot_control_tab()
         self._build_node_canvas_tab()
         self._build_code_editor_tab()
-        self._build_ask_ai_tab()
         self._build_roboapps_tab()
 
         self._refresh_profile_combo()
@@ -2891,14 +3520,14 @@ class RobotControlApp(QMainWindow):
         # --- Top bar ---
         top_bar = QHBoxLayout()
 
-        # Undo / Redo (high-contrast circular style)
+        # Undo / Redo — minimal transparent style (matches AI Agent popup icons)
         _circle_btn_style = (
             "QPushButton { font-size: 20px; font-weight: bold;"
             "  min-width: 36px; max-width: 36px;"
             "  min-height: 36px; max-height: 36px; border-radius: 18px;"
-            "  background-color: #007AFF; color: white;"
-            "  border: 2px solid #005ECB; }"
-            "QPushButton:hover { background-color: #005ECB; }"
+            "  background: transparent; color: white; border: none; }"
+            "QPushButton:hover { background: rgba(255,255,255,18); }"
+            "QPushButton:pressed { background: rgba(255,255,255,35); }"
         )
         self.canvas_undo_btn = QPushButton("\u21BA")
         self.canvas_undo_btn.setToolTip("Undo")
@@ -2930,16 +3559,15 @@ class RobotControlApp(QMainWindow):
         self.canvas_add_btn.clicked.connect(self._canvas_add_menu)
         top_bar.addWidget(self.canvas_add_btn)
 
-        # - button (high-contrast circular style)
+        # - button — minimal transparent style; red tint when delete mode active
         _delete_btn_style = (
             "QPushButton { font-size: 20px; font-weight: bold;"
             "  min-width: 36px; max-width: 36px;"
             "  min-height: 36px; max-height: 36px; border-radius: 18px;"
-            "  background-color: #FF3B30; color: white;"
-            "  border: 2px solid #CC2A22; }"
-            "QPushButton:hover { background-color: #CC2A22; }"
-            "QPushButton:checked { background-color: #CC2A22;"
-            "  border: 2px solid #FFFFFF; }"
+            "  background: transparent; color: white; border: none; }"
+            "QPushButton:hover { background: rgba(255,255,255,18); }"
+            "QPushButton:pressed { background: rgba(255,255,255,35); }"
+            "QPushButton:checked { background: rgba(255,59,48,0.4); color: white; }"
         )
         self.canvas_delete_btn = QPushButton("\u2212")
         self.canvas_delete_btn.setToolTip("Delete mode — click red X to remove items")
@@ -3901,14 +4529,14 @@ class RobotControlApp(QMainWindow):
         # Top bar
         top_bar = QHBoxLayout()
 
-        # Undo / Redo buttons (high-contrast circular style)
+        # Undo / Redo — minimal transparent style (matches AI Agent popup icons)
         _circle_btn_style = (
             "QPushButton { font-size: 20px; font-weight: bold;"
             "  min-width: 36px; max-width: 36px;"
             "  min-height: 36px; max-height: 36px; border-radius: 18px;"
-            "  background-color: #007AFF; color: white;"
-            "  border: 2px solid #005ECB; }"
-            "QPushButton:hover { background-color: #005ECB; }"
+            "  background: transparent; color: white; border: none; }"
+            "QPushButton:hover { background: rgba(255,255,255,18); }"
+            "QPushButton:pressed { background: rgba(255,255,255,35); }"
         )
         self.undo_btn = QPushButton("\u21BA")          # ↺ anti-clockwise
         self.undo_btn.setToolTip("Undo")
@@ -3948,27 +4576,46 @@ class RobotControlApp(QMainWindow):
 
         top_bar.addStretch()
 
-        # Font size buttons (high-contrast circular style)
+        # Font size buttons — small A / big A (matches AI Agent popup icon style)
+        _small_a_style = (
+            "QPushButton { font-size: 11px; font-weight: normal;"
+            "  min-width: 36px; max-width: 36px;"
+            "  min-height: 36px; max-height: 36px; border-radius: 18px;"
+            "  background: transparent; color: white; border: none; }"
+            "QPushButton:hover { background: rgba(255,255,255,18); }"
+            "QPushButton:pressed { background: rgba(255,255,255,35); }"
+        )
+        _large_a_style = (
+            "QPushButton { font-size: 18px; font-weight: bold;"
+            "  min-width: 36px; max-width: 36px;"
+            "  min-height: 36px; max-height: 36px; border-radius: 18px;"
+            "  background: transparent; color: white; border: none; }"
+            "QPushButton:hover { background: rgba(255,255,255,18); }"
+            "QPushButton:pressed { background: rgba(255,255,255,35); }"
+        )
         self.font_smaller_btn = QPushButton("A")
         self.font_smaller_btn.setToolTip("Decrease font size")
-        self.font_smaller_btn.setStyleSheet(
-            _circle_btn_style + " QPushButton { font-size: 14px; }"
-        )
+        self.font_smaller_btn.setStyleSheet(_small_a_style)
         self.font_smaller_btn.clicked.connect(self._decrease_font_size)
         top_bar.addWidget(self.font_smaller_btn)
 
         self.font_larger_btn = QPushButton("A")
         self.font_larger_btn.setToolTip("Increase font size")
-        self.font_larger_btn.setStyleSheet(
-            _circle_btn_style + " QPushButton { font-size: 20px; }"
-        )
+        self.font_larger_btn.setStyleSheet(_large_a_style)
         self.font_larger_btn.clicked.connect(self._increase_font_size)
         top_bar.addWidget(self.font_larger_btn)
 
-        # Full View: search button
-        self.fv_search_btn = QPushButton("\U0001F50D")
+        # Full View: search button — drawn magnifier icon (matches AI Agent popup)
+        self.fv_search_btn = QPushButton()
+        self.fv_search_btn.setFixedSize(36, 36)
+        self.fv_search_btn.setIcon(_draw_search_icon(20, "white"))
+        self.fv_search_btn.setIconSize(QSize(20, 20))
         self.fv_search_btn.setToolTip("Search in code")
-        self.fv_search_btn.setStyleSheet(_circle_btn_style)
+        self.fv_search_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 18px; }"
+            "QPushButton:hover { background: rgba(255,255,255,18); }"
+            "QPushButton:pressed { background: rgba(255,255,255,35); }"
+        )
         self.fv_search_btn.clicked.connect(self._fv_toggle_search)
         top_bar.addWidget(self.fv_search_btn)
         self.fv_search_btn.hide()
@@ -3981,16 +4628,15 @@ class RobotControlApp(QMainWindow):
         top_bar.addWidget(self.fv_add_btn)
         self.fv_add_btn.hide()
 
-        # Full View: delete (−) button
+        # Full View: delete (−) button — transparent; red tint when delete mode active
         _fv_delete_btn_style = (
             "QPushButton { font-size: 20px; font-weight: bold;"
             "  min-width: 36px; max-width: 36px;"
             "  min-height: 36px; max-height: 36px; border-radius: 18px;"
-            "  background-color: #FF3B30; color: white;"
-            "  border: 2px solid #CC2A22; }"
-            "QPushButton:hover { background-color: #CC2A22; }"
-            "QPushButton:checked { background-color: #CC2A22;"
-            "  border: 2px solid #FFFFFF; }"
+            "  background: transparent; color: white; border: none; }"
+            "QPushButton:hover { background: rgba(255,255,255,18); }"
+            "QPushButton:pressed { background: rgba(255,255,255,35); }"
+            "QPushButton:checked { background: rgba(255,59,48,0.4); color: white; }"
         )
         self.fv_delete_btn = QPushButton("\u2212")
         self.fv_delete_btn.setToolTip("Delete mode — click red X to remove items")
@@ -4018,20 +4664,21 @@ class RobotControlApp(QMainWindow):
         self.editor_deploy_btn.clicked.connect(self._deploy_from_editor)
         top_bar.addWidget(self.editor_deploy_btn)
 
-        # AI button — visible in both Simple and Expert views
-        editor_ai_btn = QPushButton()
-        editor_ai_btn.setFixedSize(34, 34)
-        editor_ai_btn.setIcon(_draw_ai_circle_icon(34))
-        editor_ai_btn.setIconSize(QSize(34, 34))
-        editor_ai_btn.setStyleSheet(
+        # AI button — Expert View only (hidden until _show_full_view is called)
+        self.fv_ai_btn = QPushButton()
+        self.fv_ai_btn.setFixedSize(34, 34)
+        self.fv_ai_btn.setIcon(_draw_ai_circle_icon(34))
+        self.fv_ai_btn.setIconSize(QSize(34, 34))
+        self.fv_ai_btn.setStyleSheet(
             "QPushButton { background: transparent; border: none; border-radius: 17px; }"
             "QPushButton:hover { background: rgba(255,255,255,20); }"
             "QPushButton:pressed { background: rgba(255,255,255,40); }"
         )
-        editor_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        editor_ai_btn.setToolTip("AI Agent")
-        editor_ai_btn.clicked.connect(self._show_ai_popup)
-        top_bar.addWidget(editor_ai_btn)
+        self.fv_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fv_ai_btn.setToolTip("AI Agent — debug current file")
+        self.fv_ai_btn.clicked.connect(self._show_ai_popup_from_expert_view)
+        self.fv_ai_btn.hide()
+        top_bar.addWidget(self.fv_ai_btn)
 
         layout.addLayout(top_bar)
 
@@ -4165,109 +4812,6 @@ class RobotControlApp(QMainWindow):
     def _make_send_icon(self, size=44):
         return _draw_send_icon(size)
 
-    def _build_ask_ai_tab(self):
-        tab = QWidget()
-        tab.setStyleSheet("background-color: #1E1E1E;")
-        outer = QVBoxLayout(tab)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        # --- Top bar ---
-        top_bar = QWidget()
-        top_bar.setStyleSheet("background-color: #2C2C2E; border-bottom: 1px solid #3A3A3C;")
-        top_bar.setFixedHeight(44)
-        tb_layout = QHBoxLayout(top_bar)
-        tb_layout.setContentsMargins(12, 0, 12, 0)
-
-        api_key_btn = QPushButton("API Key")
-        api_key_btn.setFixedHeight(28)
-        api_key_btn.setStyleSheet(
-            "QPushButton { background: #3A3A3C; color: #EBEBF5; border-radius: 7px;"
-            " padding: 0 12px; font-size: 12px; border: none; }"
-            "QPushButton:hover { background: #48484A; }"
-            "QPushButton:pressed { background: #636366; }"
-        )
-        api_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        api_key_btn.clicked.connect(self._show_api_key_dialog)
-        tb_layout.addWidget(api_key_btn)
-        tb_layout.addStretch()
-        outer.addWidget(top_bar)
-
-        # Content area — proportions (out of 10 parts):
-        #   top gap  :  1 = 10%
-        #   terminal :  6 = 60%
-        #   prompt   :  2 = 20%  (80% wide, centred)
-        #   bottom   :  1 = 10%
-
-        # Top gap (10%)
-        outer.addStretch(1)
-
-        # Terminal output (60%)
-        self._ai_output = QTextEdit()
-        self._ai_output.setReadOnly(True)
-        self._ai_output.setStyleSheet(
-            "QTextEdit { background-color: #1E1E1E; color: #F0F0F0;"
-            " border: none; padding: 14px; }"
-        )
-        mono = QFont("Menlo", 13)
-        mono.setFixedPitch(True)
-        self._ai_output.setFont(mono)
-        outer.addWidget(self._ai_output, 6)
-
-        # Prompt row — 80% wide, centred (20%)
-        prompt_row = QWidget()
-        prompt_row.setStyleSheet("background: transparent;")
-        pr_layout = QHBoxLayout(prompt_row)
-        pr_layout.setContentsMargins(0, 0, 0, 0)
-        pr_layout.setSpacing(0)
-
-        prompt_container = QWidget()
-        prompt_container.setStyleSheet("background-color: #2C2C2E; border-radius: 12px;")
-        p_layout = QHBoxLayout(prompt_container)
-        p_layout.setContentsMargins(12, 12, 12, 12)
-        p_layout.setSpacing(10)
-
-        self._ai_input = QPlainTextEdit()
-        self._ai_input.setPlaceholderText(
-            "I can help you to generate code, create an app or debug your project."
-        )
-        self._ai_input.setStyleSheet(
-            "QPlainTextEdit { background-color: #3A3A3C; color: #F0F0F0;"
-            " border: 1px solid #48484A; border-radius: 10px;"
-            " font-size: 13px; padding: 8px; }"
-        )
-        mono_input = QFont("Menlo", 13)
-        mono_input.setFixedPitch(True)
-        self._ai_input.setFont(mono_input)
-        p_layout.addWidget(self._ai_input, 1)
-
-        self._ask_ai_btn = QPushButton()
-        icon_size = 44
-        self._ask_ai_btn.setFixedSize(icon_size, icon_size)
-        self._ask_ai_btn.setIcon(self._make_send_icon(icon_size))
-        self._ask_ai_btn.setIconSize(QSize(icon_size, icon_size))
-        self._ask_ai_btn.setStyleSheet(
-            "QPushButton { background: transparent; border: none; border-radius: 22px; }"
-            "QPushButton:hover { background: rgba(255,255,255,25); }"
-            "QPushButton:pressed { background: rgba(255,255,255,55); }"
-            "QPushButton:disabled { background: transparent; }"
-        )
-        self._ask_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._ask_ai_btn.setToolTip("Send")
-        self._ask_ai_btn.clicked.connect(self._ask_ai)
-        p_layout.addWidget(self._ask_ai_btn)
-
-        pr_layout.addStretch(1)          # 10% left margin
-        pr_layout.addWidget(prompt_container, 8)  # 80% width
-        pr_layout.addStretch(1)          # 10% right margin
-
-        outer.addWidget(prompt_row, 2)
-
-        # Bottom gap (10%)
-        outer.addStretch(1)
-
-        self.tabs.addTab(tab, "AI Agent")
-
     def _show_api_key_dialog(self):
         """Popup to enter/save the Claude API key."""
         dlg = QDialog(self)
@@ -4320,62 +4864,6 @@ class RobotControlApp(QMainWindow):
                 self._claude_api_key = key
                 self._save_claude_api_key(key)
 
-    def _ask_ai(self):
-        """Send the prompt to Claude and stream the response into the terminal."""
-        prompt = self._ai_input.toPlainText().strip()
-        if not prompt:
-            return
-        if not self._claude_api_key:
-            self._ai_output.append(
-                '<span style="color:#FF453A;">⚠ No API key set. '
-                'Click <b>API Key</b> to add your Claude API key.</span>'
-            )
-            return
-        if self._claude_worker and self._claude_worker.isRunning():
-            return  # already busy
-
-        # Echo prompt in terminal
-        self._ai_input.clear()
-        self._ai_output.append(
-            f'<span style="color:#30D158; font-weight:bold;">▶ You</span>'
-            f'<br><span style="color:#EBEBF5;">{prompt}</span><br>'
-        )
-        self._ai_output.append('<span style="color:#636366;">─────────────────────</span>')
-        self._ai_output.append('<span style="color:#0A84FF; font-weight:bold;">Claude</span><br>')
-        self._ai_output.moveCursor(QTextCursor.MoveOperation.End)
-
-        # Track conversation history
-        self._ai_history.append({"role": "user", "content": prompt})
-        self._last_user_prompt = prompt
-
-        self._ask_ai_btn.setEnabled(False)
-        self._claude_worker = _ClaudeWorker(
-            self._claude_api_key, self._ai_history, _ai_system_prompt()
-        )
-        self._claude_worker.token_received.connect(self._on_ai_token)
-        self._claude_worker.finished.connect(self._on_ai_finished)
-        self._claude_worker.error.connect(self._on_ai_error)
-        self._claude_worker.start()
-        self._ai_response_buffer = ""
-
-    def _on_ai_token(self, token):
-        cursor = self._ai_output.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(token)
-        self._ai_output.setTextCursor(cursor)
-        self._ai_output.ensureCursorVisible()
-        self._ai_response_buffer = getattr(self, "_ai_response_buffer", "") + token
-
-    def _on_ai_finished(self):
-        self._ai_output.append("\n")
-        self._ai_output.moveCursor(QTextCursor.MoveOperation.End)
-        reply = getattr(self, "_ai_response_buffer", "")
-        if reply:
-            self._ai_history.append({"role": "assistant", "content": reply})
-            self._maybe_create_app_from_response(reply)
-        self._ai_response_buffer = ""
-        self._ask_ai_btn.setEnabled(True)
-
     def _maybe_create_app_from_response(self, response):
         """If the response contains an APP_NAME code block, create the project on disk."""
         match = re.search(
@@ -4396,23 +4884,8 @@ class RobotControlApp(QMainWindow):
             with open(script_path, "w") as f:
                 f.write(full_code)
             self._add_custom_app_to_roboapps(app_name, app_dir)
-            self._ai_output.append(
-                f'<br><span style="color:#30D158;">✓ App <b>{app_name}</b> created and added to RoboApps.<br>'
-                f'<span style="color:#636366;">{script_path}</span></span><br>'
-            )
-        except OSError as e:
-            self._ai_output.append(
-                f'<br><span style="color:#FF453A;">✗ Could not write project files: {e}</span><br>'
-            )
-        self._ai_output.moveCursor(QTextCursor.MoveOperation.End)
-
-    def _on_ai_error(self, msg):
-        self._ai_output.append(
-            f'<br><span style="color:#FF453A;">Error: {msg}</span><br>'
-        )
-        self._ai_output.moveCursor(QTextCursor.MoveOperation.End)
-        self._ai_response_buffer = ""
-        self._ask_ai_btn.setEnabled(True)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------ #
     #  Tab 5: RoboApps                                                     #
@@ -4473,10 +4946,10 @@ class RobotControlApp(QMainWindow):
             "QPushButton { font-size: 18px; font-weight: bold;"
             "  min-width: 30px; max-width: 30px;"
             "  min-height: 30px; max-height: 30px; border-radius: 15px;"
-            "  background-color: #3A3A3C; color: white; border: none; }"
-            "QPushButton:hover { background-color: #48484A; }"
-            "QPushButton:pressed { background-color: #636366; }"
-            "QPushButton:checked { background-color: #FF3B30; }"
+            "  background: transparent; color: white; border: none; }"
+            "QPushButton:hover { background: rgba(255,255,255,18); }"
+            "QPushButton:pressed { background: rgba(255,255,255,35); }"
+            "QPushButton:checked { background: rgba(255,59,48,0.4); color: white; }"
         )
 
         ra_add_btn = QPushButton("+")
@@ -4512,8 +4985,8 @@ class RobotControlApp(QMainWindow):
         ra_ai_btn.setIconSize(QSize(34, 34))
         ra_ai_btn.setStyleSheet(
             "QPushButton { background: transparent; border: none; border-radius: 17px; }"
-            "QPushButton:hover { background: rgba(0,0,0,30); }"
-            "QPushButton:pressed { background: rgba(0,0,0,60); }"
+            "QPushButton:hover { background: rgba(0,0,0,8); }"
+            "QPushButton:pressed { background: rgba(0,0,0,16); }"
         )
         ra_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         ra_ai_btn.setToolTip("AI Agent")
@@ -4549,6 +5022,19 @@ class RobotControlApp(QMainWindow):
             click_handler=self._on_new_app_clicked,
         )
         self._roboapps_icons_layout.addWidget(new_app_widget)
+
+        # Launch Pad app icon — second from left
+        launchpad_widget, _ = self._make_app_icon_widget(
+            symbol="🚀",
+            label_text="Launch Pad",
+            bg_color="#5856D6",
+            hover_color="#3634A3",
+            pressed_color="#2B2980",
+            text_color="white",
+            tooltip="Launch Pad — run apps in sequence",
+            click_handler=self._show_launchpad_dialog,
+        )
+        self._roboapps_icons_layout.addWidget(launchpad_widget)
 
         # RoboSim app icon (iPhone-style)
         robosim_widget, _ = self._make_app_icon_widget(
@@ -4795,12 +5281,38 @@ class RobotControlApp(QMainWindow):
         if self._ai_popup is None:
             self._ai_popup = _AIChatDialog(
                 api_key_getter=lambda: self._claude_api_key,
+                api_key_dialog_cb=self._show_api_key_dialog,
                 on_response_complete=self._maybe_create_app_from_response,
                 parent=self,
             )
         self._ai_popup.show()
         self._ai_popup.raise_()
         self._ai_popup.activateWindow()
+
+    def _show_launchpad_dialog(self):
+        """Open the Launch Pad sequencer dialog (modeless — does not block the app)."""
+        # Re-use existing window if already open
+        if hasattr(self, "_launchpad_dlg") and self._launchpad_dlg is not None:
+            self._launchpad_dlg.raise_()
+            self._launchpad_dlg.activateWindow()
+            return
+        dlg = _LaunchPadDialog(
+            apps=list(self._custom_apps),
+            ssh_connected_cb=lambda: self.ssh_client is not None,
+            launch_cb=self._launch_custom_app,
+            parent=self,
+        )
+        self._launchpad_dlg = dlg
+        dlg.finished.connect(lambda _: setattr(self, "_launchpad_dlg", None))
+        dlg.show()
+
+    def _show_ai_popup_from_expert_view(self):
+        """Show AI Agent popup pre-loaded with the current Expert View file as context."""
+        self._show_ai_popup()
+        fname = getattr(self, "_full_view_current_file", None)
+        content = self.full_editor.toPlainText()
+        if fname and content:
+            self._ai_popup.set_file_context(fname, content)
 
     def _show_conda_not_installed_dialog(self):
         """Show the 'Conda not installed' dialog and trigger installation if chosen."""
@@ -5437,6 +5949,7 @@ class RobotControlApp(QMainWindow):
         self.fv_add_btn.hide()
         self.fv_delete_btn.hide()
         self.fv_search_btn.hide()
+        self.fv_ai_btn.hide()
         self._fv_search_bar.hide()
         self._fv_search_input.clear()
         # Load persisted logic from movement.py
@@ -5452,6 +5965,7 @@ class RobotControlApp(QMainWindow):
         self.fv_add_btn.show()
         self.fv_delete_btn.show()
         self.fv_search_btn.show()
+        self.fv_ai_btn.show()
         # Sync spinbox parameter values into Full View if movement.py is open
         if self._full_view_current_file == "movement_pkg/movement.py":
             self._sync_full_view_from_spinboxes()
