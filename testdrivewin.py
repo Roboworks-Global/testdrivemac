@@ -152,6 +152,100 @@ _SIMPLE_VIEW_SNIPPETS = {
 }
 
 
+# --- PE import table reader (pure Python, no extra deps) ---
+
+def _pe_import_dlls(dll_path: str) -> list:
+    """Return the list of DLL names directly imported by a Windows PE binary.
+    Used to diagnose LoadLibrary error 126 (missing dependency).
+    Returns [] on any read or parse error."""
+    import struct as _s
+    try:
+        with open(dll_path, 'rb') as _f:
+            d = _f.read()
+        if len(d) < 0x40 or d[:2] != b'MZ':
+            return []
+        pe = _s.unpack_from('<I', d, 0x3C)[0]
+        if d[pe:pe+4] != b'PE\x00\x00':
+            return []
+        opt = pe + 24
+        mg  = _s.unpack_from('<H', d, opt)[0]
+        if   mg == 0x20B: imp_off = opt + 120  # PE32+ (64-bit): DataDirectory[1] = Import Table
+        elif mg == 0x10B: imp_off = opt + 104  # PE32  (32-bit): DataDirectory[1] = Import Table
+        else: return []
+        ns = _s.unpack_from('<H', d, pe + 6)[0]
+        os_ = _s.unpack_from('<H', d, pe + 20)[0]
+        sb  = opt + os_
+        sects = [(_s.unpack_from('<I', d, sb+i*40+12)[0],
+                  _s.unpack_from('<I', d, sb+i*40+12)[0] + _s.unpack_from('<I', d, sb+i*40+8)[0],
+                  _s.unpack_from('<I', d, sb+i*40+20)[0]) for i in range(ns)]
+        def r2o(r):
+            for vs, ve, ro in sects:
+                if vs <= r < ve: return ro + (r - vs)
+            return None
+        ir = _s.unpack_from('<I', d, imp_off)[0]
+        if not ir: return []
+        cur = r2o(ir)
+        if cur is None: return []
+        names = []
+        while True:
+            nr = _s.unpack_from('<I', d, cur + 12)[0]
+            if not nr: break
+            no = r2o(nr)
+            if no is None: break
+            names.append(d[no:d.index(b'\x00', no)].decode('ascii', errors='replace'))
+            cur += 20
+        return names
+    except Exception:
+        return []
+
+# Windows system DLLs that are always present via the OS loader (not on-disk in PATH)
+_WIN_SYS_DLLS = frozenset({
+    'kernel32.dll', 'ntdll.dll', 'user32.dll', 'gdi32.dll', 'advapi32.dll',
+    'shell32.dll', 'ole32.dll', 'oleaut32.dll', 'ws2_32.dll', 'ucrtbase.dll',
+    'version.dll', 'winmm.dll', 'd3d11.dll', 'opengl32.dll', 'shlwapi.dll',
+    'winspool.drv', 'comctl32.dll', 'comdlg32.dll', 'psapi.dll', 'userenv.dll',
+    'msvcrt.dll', 'rpcrt4.dll', 'bcrypt.dll', 'crypt32.dll', 'setupapi.dll',
+    'netapi32.dll', 'iphlpapi.dll', 'dbghelp.dll', 'd3dcompiler_47.dll',
+    'dxgi.dll', 'd3d12.dll', 'dwmapi.dll', 'uxtheme.dll',
+})
+_WIN_SYS_PREFIXES = ('api-ms-win-', 'ext-ms-', 'msvcp', 'vcruntime', 'mfc')
+
+
+def _dll_dep_report(dll_path: str, conda_prefix: str) -> str:
+    """Check which direct imports of dll_path are missing from the conda env.
+    Returns a human-readable diagnostic string."""
+    search_dirs = [
+        os.path.join(conda_prefix, "Library", "bin"),
+        os.path.join(conda_prefix, "Library", "mingw-w64", "bin"),
+        os.path.join(conda_prefix, "Library", "usr", "bin"),
+        os.path.join(conda_prefix, "Scripts"),
+        os.path.join(conda_prefix),
+    ]
+    imports = _pe_import_dlls(dll_path)
+    if not imports:
+        return "(could not read import table — DLL may be missing or malformed)"
+    missing, found = [], []
+    for imp in imports:
+        n = imp.lower()
+        if n in _WIN_SYS_DLLS or any(n.startswith(p) for p in _WIN_SYS_PREFIXES):
+            continue
+        if any(os.path.isfile(os.path.join(d, imp)) for d in search_dirs):
+            found.append(imp)
+        else:
+            missing.append(imp)
+    lines = [f"Checked {len(imports)} direct imports of {os.path.basename(dll_path)}:"]
+    if missing:
+        lines.append(f"  MISSING ({len(missing)}) — likely cause of LoadLibrary error 126:")
+        lines.extend(f"    \u2717 {x}" for x in missing)
+    else:
+        lines.append("  All direct imports found on disk (missing dep may be transitive).")
+    if found:
+        preview = found[:6]
+        lines.append(f"  Present ({len(found)}): {', '.join(preview)}"
+                     + (" ..." if len(found) > 6 else ""))
+    return "\n".join(lines)
+
+
 # --- Worker threads ---
 
 class ConnectWorker(QThread):
@@ -516,7 +610,12 @@ class SimOutputWorker(QThread):
     def stop(self):
         if self._process and self._process.poll() is None:
             try:
-                self._process.terminate()
+                # /T kills the entire process tree (cmd.exe + python.exe children).
+                # Plain terminate() only kills cmd.exe; python movement.py survives.
+                subprocess.run(
+                    ['taskkill', '/F', '/T', '/PID', str(self._process.pid)],
+                    capture_output=True,
+                )
             except Exception:
                 try:
                     self._process.kill()
@@ -550,10 +649,10 @@ class SimInitiationDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
 
         instr = QLabel(
-            "Gazebo needs to receive sensor data from your code.<br><br>"
-            "When you are ready to simulate, click the <b>Start</b> button.<br>"
-            "Click <b>Stop</b> button to stop the simulation.<br><br>"
-            "If this window is closed, click the Gazebo button again to bring it back."
+            "The robot simulation is running. Open <b>RViz</b> to visualise it.<br><br>"
+            "When you are ready, click <b>Start</b> to run your movement code.<br>"
+            "Click <b>Stop</b> to stop the robot.<br><br>"
+            "If this window is closed, click the <b>Simulate</b> button to reopen it."
         )
         instr.setWordWrap(True)
         instr.setTextFormat(Qt.TextFormat.RichText)
@@ -673,12 +772,14 @@ class CondaInstallWorker(QThread):
     finished = pyqtSignal(bool)  # True = both steps succeeded
 
     def run(self):
+        # Miniforge only provides a Windows x86_64 installer (no ARM64 build).
+        # On Windows ARM64, x86_64 runs via emulation — it works for conda/RoboStack.
         url = (
             "https://github.com/conda-forge/miniforge/releases/latest/download/"
             "Miniforge3-Windows-x86_64.exe"
         )
         installer = os.path.join(tempfile.gettempdir(), "Miniforge3_installer.exe")
-        prefix    = os.path.expanduser("~/miniforge3")
+        prefix    = os.path.normpath(os.path.expanduser("~/miniforge3"))
 
         # ── Step 1: Download Miniforge3 ──────────────────────────────────
         try:
@@ -691,6 +792,7 @@ class CondaInstallWorker(QThread):
 
         # ── Step 2: Install Miniforge3 (silent NSIS installer) ───────────
         self.output.emit("[2/3] Installing Miniforge3 (this may take 1-2 minutes)...")
+        self.output.emit(f"    Install prefix: {prefix}")
         try:
             result = subprocess.run(
                 [installer,
@@ -701,7 +803,10 @@ class CondaInstallWorker(QThread):
                 capture_output=True, text=True, timeout=300,
             )
             if result.returncode != 0:
-                self.output.emit(f"Miniforge3 installation failed:\n{result.stderr[:500]}")
+                detail = result.stderr.strip() or result.stdout.strip() or "(no output)"
+                self.output.emit(
+                    f"Miniforge3 installation failed (exit code {result.returncode}):\n{detail[:800]}"
+                )
                 self.finished.emit(False)
                 return
             self.output.emit("Miniforge3 installed successfully.")
@@ -739,6 +844,136 @@ class CondaInstallWorker(QThread):
         except Exception as e:
             self.output.emit(f"ROS 2 installation error: {e}")
             self.finished.emit(False)
+
+
+class GazeboInstallWorker(QThread):
+    """Installs Gazebo Classic (ros-humble-gazebo-ros-pkgs) into ros_env.
+
+    Also removes any Gazebo Ignition (gz-*/libgz-*) packages from ros_env
+    if they were mistakenly installed there, and reinstalls ros-humble-rviz2
+    to repair any broken Qt/Ogre DLLs.
+    """
+    output   = pyqtSignal(str)
+    finished = pyqtSignal(bool)   # True = success
+
+    def __init__(self, conda_exe: str):
+        super().__init__()
+        self._conda_exe = conda_exe
+
+    def _run_cmd(self, cmd: list[str]) -> bool:
+        """Run a command, stream output, return True on success."""
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            for line in proc.stdout:
+                self.output.emit(line.rstrip())
+            proc.wait()
+            return proc.returncode == 0
+        except Exception as e:
+            self.output.emit(f"Error: {e}")
+            return False
+
+    def run(self):
+        # RoboStack requires mamba (not conda) for correct dependency resolution.
+        # Miniforge3 ships mamba at the same Scripts/ location as conda.
+        _mamba = self._conda_exe.replace("conda.exe", "mamba.exe")
+        _inst  = _mamba if os.path.isfile(_mamba) else self._conda_exe
+        self.output.emit(f"  Using installer: {os.path.basename(_inst)}")
+
+        # ── Step 0: Remove CONFLICTING Gazebo packages from ros_env ──────────────
+        # Only remove packages that overwrite rviz2 DLLs with incompatible versions:
+        #   gz-*/libgz-*   — full Gazebo simulator stack (shouldn't be in ros_env)
+        #   ogre-next-*    — Ogre 2.x (Gazebo's renderer) overwrites OgreMain.dll
+        #                    with an Ogre 2.x build; rviz2 needs Ogre 1.12.x
+        # Do NOT remove:
+        #   libignition-*  — needed! rviz_default_plugins.dll links against
+        #                    ignition-math6.dll (compiled into the RoboStack build)
+        #   sdformat       — harmless standalone library, not a DLL conflict
+        self.output.emit("[0/1] Scanning ros_env for conflicting Gazebo packages...")
+
+        # ogre-next: Ogre 2.x / Ogre-Next — overwrites OgreMain.dll from rviz-ogre-vendor
+        # ogre:      conda-forge's 'ogre' package is now Ogre-Next 14.x (same problem,
+        #            just renamed) — rviz-ogre-vendor bundles its own Ogre 1.12.x DLLs
+        #            and does NOT depend on the external 'ogre' conda package
+        GZ_PREFIXES = ("gz-", "libgz-", "ogre-next")
+        GZ_EXACT    = {"gz-tools2", "ogre"}
+
+        result = subprocess.run(
+            [self._conda_exe, "list", "-n", "ros_env", "--json"],
+            capture_output=True, text=True,
+        )
+        gz_to_remove = []
+        if result.returncode == 0:
+            import json as _json
+            try:
+                pkgs = _json.loads(result.stdout)
+                for p in pkgs:
+                    name = p.get("name", "")
+                    if any(name.startswith(pfx) for pfx in GZ_PREFIXES) \
+                            or name in GZ_EXACT:
+                        gz_to_remove.append(name)
+            except Exception:
+                pass
+
+        if gz_to_remove:
+            self.output.emit(
+                f"  Removing {len(gz_to_remove)} Gazebo package(s) from ros_env:\n"
+                + "    " + ", ".join(gz_to_remove)
+            )
+            self._run_cmd([
+                self._conda_exe, "remove", "-n", "ros_env", "-y", "--force",
+                *gz_to_remove,
+            ])
+        else:
+            self.output.emit("  No conflicting Gazebo packages found in ros_env.")
+
+        # Force-reinstall the full RViz2 stack.
+        # libignition-math6 → provides ignition-math6.dll (RoboStack's rviz_default_plugins
+        #                      links against it at compile time on Windows)
+        self.output.emit("  Reinstalling RViz2 stack...")
+        self._run_cmd([
+            _inst, "install", "-n", "ros_env", "-y",
+            "-c", "conda-forge", "-c", "robostack-humble",
+            "--force-reinstall",
+            "qt-main",
+            "libignition-math6",
+            "ros-humble-rviz-ogre-vendor",
+            "ros-humble-rviz-rendering",
+            "ros-humble-rviz-common",
+            "ros-humble-rviz-default-plugins",
+            "ros-humble-rviz2",
+        ])
+        self.output.emit("  ros_env cleaned up.\n")
+
+        # ── Step 1: Install Gazebo Classic into ros_env ────────────────────────
+        # ros-humble-gazebo-ros-pkgs ships Gazebo Classic 11, which shares
+        # the same Ogre 1.12.x that rviz-ogre-vendor uses — no DLL conflict.
+        # Both packages coexist in ros_env (no separate gz_env needed).
+        self.output.emit("[1/1] Installing ros-humble-gazebo-ros-pkgs into ros_env...")
+        self.output.emit("  (This may take 10-20 minutes)")
+        if not self._run_cmd([
+            _inst, "install", "-n", "ros_env", "-y",
+            "-c", "conda-forge", "-c", "robostack-humble",
+            "ros-humble-gazebo-ros-pkgs",
+        ]):
+            self.output.emit(
+                "\nFailed to install ros-humble-gazebo-ros-pkgs.\n"
+                "Gazebo Classic may not yet be available for win-64 in robostack-humble.\n\n"
+                "Try manually:\n"
+                "  mamba install -n ros_env ros-humble-gazebo-ros-pkgs \\\n"
+                "    -c conda-forge -c robostack-humble"
+            )
+            self.finished.emit(False)
+            return
+
+        self.output.emit("\nGazebo Classic (ros-humble-gazebo-ros-pkgs) installed in ros_env.")
+        self.output.emit("Gazebo Classic setup complete.")
+        self.finished.emit(True)
 
 
 # --- Drag-and-drop function buttons for Simple View ---
@@ -2294,6 +2529,8 @@ class GitPullDialog(QDialog):
 # --- Main window ---
 
 class RobotControlApp(QMainWindow):
+    _rviz_error_signal = pyqtSignal(str, str)   # (title, log_text) — emitted from bg thread
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TestDrive")
@@ -2301,13 +2538,14 @@ class RobotControlApp(QMainWindow):
         self._workers = []
         self.ssh_client = None
         self._rviz_process = None
-        self._gazebo_process = None
+        self._gazebo_process = None   # ros2 launch (Gazebo Classic)
         self._robosim_process = None
         self._sim_dialog = None
         self._syncing = False
         self._full_view_current_file = None
         self._fv_edit_mode = False
         self._blocking_item_changed = False
+        self._rviz_error_signal.connect(self._show_rviz_error_dialog)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -2345,13 +2583,13 @@ class RobotControlApp(QMainWindow):
         self.rviz_btn.clicked.connect(self._launch_rviz)
         header_row.addWidget(self.rviz_btn)
 
-        self.gazebo_btn = QPushButton("Gazebo")
+        self.gazebo_btn = QPushButton("Simulate")
         self.gazebo_btn.setFixedWidth(90)
         self.gazebo_btn.setStyleSheet(
             "background-color: #FF9500; color: white; padding: 8px; "
             "border-radius: 8px; font-weight: bold;"
         )
-        self.gazebo_btn.setToolTip("Launch Gazebo simulation with robot model")
+        self.gazebo_btn.setToolTip("Launch 2D robot simulation (visualise in RViz)")
         self.gazebo_btn.clicked.connect(self._launch_gazebo)
         header_row.addWidget(self.gazebo_btn)
 
@@ -4055,6 +4293,85 @@ class RobotControlApp(QMainWindow):
         if dlg.clickedButton() == go_btn:
             self.tabs.setCurrentIndex(0)
 
+    # ------------------------------------------------------------------
+    # Gazebo Classic detection and installation
+    # ------------------------------------------------------------------
+
+    def _find_gazebo_exe(self, conda_prefix: str) -> str | None:
+        """Return the path to gzserver.exe (Gazebo Classic) in ros_env, or None."""
+        for subdir in ("Library/bin", "Scripts", "Library/usr/bin"):
+            for name in ("gzserver.exe", "gazebo.exe"):
+                p = os.path.join(conda_prefix, *subdir.split("/"), name)
+                if os.path.isfile(p):
+                    return p
+        return shutil.which("gzserver") or shutil.which("gazebo")
+
+    def _show_gazebo_not_installed_dialog(self, conda_exe: str, conda_prefix: str):
+        """Prompt the user to install Gazebo Classic with an 'Install Now' option."""
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Gazebo Classic Not Found")
+        dlg.setText(
+            "Gazebo Classic (ros-humble-gazebo-ros-pkgs) is required for\n"
+            "3D robot simulation.\n\n"
+            "It was not found in your conda ros_env.\n\n"
+            "Click 'Install Now' to install it automatically via mamba/conda\n"
+            "(requires ~1-2 GB and may take 10–20 minutes),\n"
+            "or 'Cancel' to install it manually later.\n\n"
+            "Manual install:\n"
+            "  mamba install -n ros_env ros-humble-gazebo-ros-pkgs \\\n"
+            "    -c conda-forge -c robostack-humble"
+        )
+        install_btn = dlg.addButton("Install Now", QMessageBox.ButtonRole.AcceptRole)
+        dlg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        dlg.exec()
+        if dlg.clickedButton() == install_btn:
+            self._run_gazebo_install(conda_exe)
+
+    def _run_gazebo_install(self, conda_exe: str):
+        """Download and install Gazebo Classic in a background thread with progress."""
+        progress = QDialog(self)
+        progress.setWindowTitle("Installing Gazebo Classic")
+        progress.setMinimumWidth(560)
+        prog_layout = QVBoxLayout(progress)
+
+        prog_label = QLabel("Installing Gazebo Classic into ros_env — please wait...")
+        prog_layout.addWidget(prog_label)
+
+        prog_output = QPlainTextEdit()
+        prog_output.setReadOnly(True)
+        prog_output.setMinimumHeight(200)
+        _mono = QFont("Consolas")
+        _mono.setFixedPitch(True)
+        _mono.setPointSize(10)
+        prog_output.setFont(_mono)
+        prog_output.setStyleSheet("background:#1e1e1e; color:#d4d4d4;")
+        prog_layout.addWidget(prog_output)
+
+        close_btn = QPushButton("Close")
+        close_btn.setEnabled(False)
+        close_btn.clicked.connect(progress.accept)
+        prog_layout.addWidget(close_btn)
+
+        worker = GazeboInstallWorker(conda_exe)
+
+        def _on_output(line):
+            prog_output.appendPlainText(line)
+            prog_output.verticalScrollBar().setValue(
+                prog_output.verticalScrollBar().maximum()
+            )
+
+        def _on_finished(success):
+            close_btn.setEnabled(True)
+            if success:
+                prog_label.setText("Gazebo Classic installed. Close this window and click Gazebo again.")
+            else:
+                prog_label.setText("Installation failed — see output above.")
+
+        worker.output.connect(_on_output)
+        worker.finished.connect(_on_finished)
+        worker.start()
+        progress.exec()
+
     def _launch_robosim(self):
         """Launch RoboSim5 as a subprocess: python RobotSim5.py"""
         if self._robosim_process is not None and self._robosim_process.poll() is None:
@@ -5597,41 +5914,65 @@ class RobotControlApp(QMainWindow):
             return
         self._add_conda_to_roboapps()
 
+        # Check for ros_env contamination via conda-meta only:
+        # - ogre-next* or ogre-\d* (Ogre-Next 14.x) → incompatible Ogre ABI
+        # - gz-*/libgz-* → full Gazebo stack shouldn't be in ros_env
+        # NOTE: libignition-* is KEPT (needed by rviz_default_plugins.dll).
+        # rviz-ogre-vendor bundles Ogre 1.12.x — no standalone OgreMain.dll file
+        # is required; checking for it was a false positive (it may be statically
+        # linked or placed in a non-standard path by the RoboStack build).
+        _conda_meta_r = os.path.join(conda_prefix, "conda-meta")
+        _GZ_PFX = ("gz-", "libgz-", "ogre-next-")
+        _contaminated = False
+        try:
+            for _f in os.listdir(_conda_meta_r):
+                if (any(_f.startswith(_p) for _p in _GZ_PFX)
+                        or re.match(r"ogre-\d", _f)):   # ogre-14.x (Ogre-Next renamed)
+                    _contaminated = True
+                    break
+        except Exception:
+            pass
+        if _contaminated:
+            envs_dir2 = os.path.dirname(conda_prefix)
+            base_conda_dir2 = (os.path.dirname(envs_dir2)
+                               if os.path.basename(envs_dir2).lower() == "envs"
+                               else envs_dir2)
+            conda_exe2 = os.path.join(base_conda_dir2, "Scripts", "conda.exe")
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle("RViz2 Repair Needed")
+            dlg.setText(
+                "ros_env contains Gazebo DLLs that overwrite Qt5 and Ogre\n"
+                "libraries required by RViz2.\n\n"
+                "RViz2 will start but show no window until this is repaired.\n\n"
+                "Click 'Repair Now' to clean ros_env and restore RViz2 (~5-15 min).\n"
+                "Click 'Launch Anyway' to try RViz2 as-is."
+            )
+            repair_btn = dlg.addButton("Repair Now",    QMessageBox.ButtonRole.AcceptRole)
+            dlg.addButton(             "Launch Anyway", QMessageBox.ButtonRole.DestructiveRole)
+            dlg.exec()
+            clicked = dlg.clickedButton()
+            if clicked == repair_btn:
+                self._run_gazebo_install(conda_exe2)
+                return
+            # "Launch Anyway" falls through
+
         # Get robot IP
         robot_ip = self.ip_input.text().strip()
         if not robot_ip:
             self._log("ERROR: Enter a robot IP address before launching RViz2.")
             return
 
-        # Build subprocess environment
+        # Find base conda.exe (conda_prefix = .../miniforge3/envs/ros_env
+        #                      → base          = .../miniforge3)
+        envs_dir = os.path.dirname(conda_prefix)
+        base_conda_dir = (os.path.dirname(envs_dir)
+                          if os.path.basename(envs_dir).lower() == "envs"
+                          else envs_dir)
+        conda_exe = os.path.join(base_conda_dir, "Scripts", "conda.exe")
+
+        # Runtime-only env — conda run handles PATH / DLL paths / AMENT_PREFIX_PATH
+        # via the activation scripts; we only need to add DDS config on top.
         env = os.environ.copy()
-        conda_scripts  = os.path.join(conda_prefix, "Scripts")
-        conda_lib_bin  = os.path.join(conda_prefix, "Library", "bin")
-        conda_lib_mingw = os.path.join(conda_prefix, "Library", "mingw-w64", "bin")
-        conda_lib_usr  = os.path.join(conda_prefix, "Library", "usr", "bin")
-
-        env["PATH"] = (
-            conda_prefix + ";" +
-            conda_scripts + ";" +
-            conda_lib_bin + ";" +
-            conda_lib_mingw + ";" +
-            conda_lib_usr + ";" +
-            env.get("PATH", "")
-        )
-        env["CONDA_PREFIX"] = conda_prefix
-        env["CONDA_DEFAULT_ENV"] = "ros_env"
-
-        # ROS2 environment variables
-        env["AMENT_PREFIX_PATH"] = conda_prefix
-        env["CMAKE_PREFIX_PATH"] = conda_prefix
-        env["COLCON_PREFIX_PATH"] = conda_prefix
-
-        # Python path (Windows uses Lib\site-packages)
-        py_site = os.path.join(conda_prefix, "Lib", "site-packages")
-        if os.path.isdir(py_site):
-            env["PYTHONPATH"] = py_site + ";" + env.get("PYTHONPATH", "")
-
-        # DDS configuration
         env["ROS_DOMAIN_ID"] = env.get("ROS_DOMAIN_ID", "0")
         env.pop("ROS_LOCALHOST_ONLY", None)        # never restrict to loopback
         if robot_ip == "127.0.0.1":
@@ -5639,40 +5980,121 @@ class RobotControlApp(QMainWindow):
             env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
         else:
             # Real robot: use FastDDS (ROS2 Humble default on most robots)
-            # Add unicast initial peer so discovery works reliably over WiFi
             env["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
             env.pop("CYCLONEDDS_URI", None)
             fastdds_xml = self._generate_fastdds_xml(robot_ip)
-            # Set both old and new variable names (FastDDS 2.x vs 3.x)
             env["FASTRTPS_DEFAULT_PROFILES_FILE"] = fastdds_xml
             env["FASTDDS_DEFAULT_PROFILES_FILE"] = fastdds_xml
 
-        # Build command — try Library\bin first, fall back to Scripts
         rviz_config = os.path.join(_PKG_DIR, "default_view.rviz")
-        rviz_exe = os.path.join(conda_lib_bin, "rviz2.exe")
-        if not os.path.isfile(rviz_exe):
-            rviz_exe = os.path.join(conda_scripts, "rviz2.exe")
-        cmd = [rviz_exe, "-d", rviz_config]
+
+        # Use a bat file with "call conda activate" instead of "conda run".
+        # conda run on Windows can fail to set the DLL search path correctly for
+        # Qt-based GUI apps (exit code 0xC0000139 = STATUS_ENTRYPOINT_NOT_FOUND).
+        # A proper shell activation via activate.bat resolves all DLL paths.
+        activate_bat = os.path.join(base_conda_dir, "Scripts", "activate.bat")
+        bat_lines = [
+            "@echo off",
+            f'call "{activate_bat}" ros_env',
+            f'set ROS_DOMAIN_ID={env.get("ROS_DOMAIN_ID", "0")}',
+            f'set RMW_IMPLEMENTATION={env.get("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")}',
+        ]
+        if "FASTRTPS_DEFAULT_PROFILES_FILE" in env:
+            bat_lines.append(f'set FASTRTPS_DEFAULT_PROFILES_FILE={env["FASTRTPS_DEFAULT_PROFILES_FILE"]}')
+        if "FASTDDS_DEFAULT_PROFILES_FILE" in env:
+            bat_lines.append(f'set FASTDDS_DEFAULT_PROFILES_FILE={env["FASTDDS_DEFAULT_PROFILES_FILE"]}')
+        bat_lines.append(f'rviz2 -d "{rviz_config}"')
+        import tempfile as _tempfile
+        bat_path = os.path.join(_tempfile.gettempdir(), "_rviz_launch.bat")
+        with open(bat_path, "wb") as _bf:
+            _bf.write(("\r\n".join(bat_lines) + "\r\n").encode("ascii"))
+        cmd = ["cmd.exe", "/c", bat_path]
 
         self._log(f"Launching RViz2 ({'local Gazebo' if robot_ip == '127.0.0.1' else robot_ip})...")
         self._log(f"  conda env: {conda_prefix}")
 
+        rviz_log = os.path.join(_PKG_DIR, ".rviz_launch.log")
         try:
-            self._rviz_process = subprocess.Popen(
-                cmd,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            with open(rviz_log, 'w') as log_fh:
+                self._rviz_process = subprocess.Popen(
+                    cmd,
+                    stdout=log_fh,
+                    stderr=log_fh,
+                    start_new_session=True,
+                )
             self._log(f"  RViz2 started (PID {self._rviz_process.pid}).")
+            self._log(f"  Log file: {rviz_log}")
+            # Check after a short delay if it exited immediately
+            import threading
+            def _check_rviz():
+                import time; time.sleep(5)
+                try:
+                    with open(rviz_log, 'r', errors='replace') as _f:
+                        log_content = _f.read()
+                except Exception:
+                    log_content = "(log unreadable)"
+                tail_lines = log_content.splitlines()[-20:]
+                # If LoadLibrary error 126, append a dependency diagnostic
+                if "LoadLibrary error: 126" in log_content:
+                    _plugins_dll = os.path.join(
+                        conda_prefix, "Library", "bin", "rviz_default_plugins.dll")
+                    _diag = _dll_dep_report(_plugins_dll, conda_prefix)
+                    log_content += (
+                        "\n\n--- Dependency diagnostic for rviz_default_plugins.dll ---\n"
+                        + _diag + "\n")
+                if self._rviz_process.poll() is not None:
+                    code = self._rviz_process.returncode
+                    self._log(f"WARNING: RViz2 exited with code {code}.")
+                    self._log("--- RViz2 log (last lines) ---\n  " +
+                              "\n  ".join(tail_lines))
+                    self._rviz_error_signal.emit(
+                        f"RViz2 exited (code {code})", log_content)
+                elif "[ERROR]" in log_content or "[WARN]" in log_content:
+                    error_lines = [l for l in log_content.splitlines()
+                                   if "[ERROR]" in l or "[WARN]" in l]
+                    self._log("WARNING: RViz2 reported errors while running.")
+                    self._log("--- RViz2 errors ---\n  " +
+                              "\n  ".join(error_lines[:10]))
+                    self._rviz_error_signal.emit(
+                        "RViz2 plugin errors", log_content)
+            threading.Thread(target=_check_rviz, daemon=True).start()
         except FileNotFoundError:
             self._log(
-                "ERROR: rviz2.exe not found in ros_env.\n"
-                "  Run: setup_robostack_windows.bat to reinstall ros_env"
+                f"ERROR: conda.exe not found at {conda_exe}\n"
+                "  Run: setup_robostack_windows.bat to reinstall"
             )
         except Exception as e:
             self._log(f"ERROR launching RViz2: {e}")
+
+    def _show_rviz_error_dialog(self, title: str, log_text: str):
+        """Show a copyable dialog with the RViz2 log output (called on main thread via signal)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"RViz2 – {title}")
+        dlg.setMinimumWidth(740)
+        dlg.setMinimumHeight(400)
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel(
+            "RViz2 log output — select text to copy, or use the button below:"))
+
+        text_edit = QPlainTextEdit()
+        text_edit.setPlainText(log_text.strip())
+        text_edit.setReadOnly(True)
+        text_edit.setFont(QFont("Consolas", 9))
+        layout.addWidget(text_edit)
+
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy All")
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(log_text.strip()))
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(copy_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        dlg.exec()
 
     def _stop_gazebo(self):
         """Kill any running Gazebo processes (tracked and stale) and free port 11345."""
@@ -5695,35 +6117,21 @@ class RobotControlApp(QMainWindow):
             except Exception:
                 pass
             self._gazebo_log_fh = None
-        # Kill any stale gzserver left over from a previous session (frees port 11345).
-        subprocess.run(
-            ['taskkill', '/F', '/IM', 'gzserver.exe'],
-            capture_output=True,
-        )
-        time.sleep(2.0)  # give gzserver time to fully release port 11345
+        # Kill any stale Gazebo Classic processes from a previous session.
+        # taskkill exits with non-zero if the process is not found — that is fine.
+        killed = False
+        for exe in ('gzserver.exe', 'gzclient.exe'):
+            r = subprocess.run(['taskkill', '/F', '/IM', exe], capture_output=True)
+            if r.returncode == 0:
+                killed = True
+        if killed:
+            time.sleep(2.0)  # give gzserver time to fully release port 11345
 
     def _launch_gazebo(self):
-        """Launch Gazebo simulation in a separate process via the conda ros_env.
-        If Gazebo is already running, just bring back the Simulation Control window."""
-        gazebo_handle_alive = (
-            self._gazebo_process is not None
-            and self._gazebo_process.poll() is None
-        )
-        gzserver_alive = (
-            subprocess.run(
-                ['tasklist', '/FI', 'IMAGENAME eq gzserver.exe'],
-                capture_output=True, text=True,
-            ).stdout.find('gzserver.exe') != -1
-        )
-        gzclient_alive = (
-            subprocess.run(
-                ['tasklist', '/FI', 'IMAGENAME eq gzclient.exe'],
-                capture_output=True, text=True,
-            ).stdout.find('gzclient.exe') != -1
-        )
-        if gazebo_handle_alive and gzserver_alive and gzclient_alive:
-            # Both server and client are running — just reopen the dialog
-            self._log("Gazebo is already running. Reopening Simulation Control.")
+        """Launch the Python 2D simulation (sim_node.py) via ros_env.
+        If already running, just bring back the Simulation Control window."""
+        if self._gazebo_process is not None and self._gazebo_process.poll() is None:
+            self._log("Simulation is already running. Reopening Simulation Control.")
             self._show_sim_initiation_dialog()
             return
 
@@ -5737,85 +6145,54 @@ class RobotControlApp(QMainWindow):
             return
         self._add_conda_to_roboapps()
 
-        # Build subprocess environment (same pattern as _launch_rviz)
-        env = os.environ.copy()
-        conda_scripts  = os.path.join(conda_prefix, "Scripts")
-        conda_lib_bin  = os.path.join(conda_prefix, "Library", "bin")
-        conda_lib_mingw = os.path.join(conda_prefix, "Library", "mingw-w64", "bin")
-        conda_lib_usr  = os.path.join(conda_prefix, "Library", "usr", "bin")
+        # Find base conda dir (same logic as _launch_rviz)
+        envs_dir = os.path.dirname(conda_prefix)
+        base_conda_dir = (os.path.dirname(envs_dir)
+                          if os.path.basename(envs_dir).lower() == "envs"
+                          else envs_dir)
+        conda_exe = os.path.join(base_conda_dir, "Scripts", "conda.exe")
 
-        env["PATH"] = (
-            conda_prefix + ";" +
-            conda_scripts + ";" +
-            conda_lib_bin + ";" +
-            conda_lib_mingw + ";" +
-            conda_lib_usr + ";" +
-            env.get("PATH", "")
-        )
-        env["CONDA_PREFIX"] = conda_prefix
-        env["CONDA_DEFAULT_ENV"] = "ros_env"
+        ros_log = os.path.join(_PKG_DIR, ".gazebo_launch.log")
 
-        # ROS2 environment variables
-        env["AMENT_PREFIX_PATH"] = conda_prefix
-        env["CMAKE_PREFIX_PATH"] = conda_prefix
-        env["COLCON_PREFIX_PATH"] = conda_prefix
+        self._log("Launching Python 2D simulation...")
+        self._log(f"  ros_env: {conda_prefix}")
+        self._log("  (Gazebo Classic/Ignition crash on Windows ARM64 — using sim_node.py)")
 
-        # Python path (Windows uses Lib\site-packages)
-        py_site = os.path.join(conda_prefix, "Lib", "site-packages")
-        if os.path.isdir(py_site):
-            env["PYTHONPATH"] = py_site + ";" + env.get("PYTHONPATH", "")
+        # Use a bat file with "call conda activate" so that all DLL paths are
+        # set correctly (same approach as RViz2 launch).
+        activate_bat = os.path.join(base_conda_dir, "Scripts", "activate.bat")
+        launch_file  = os.path.join(_PKG_DIR, "launch", "gazebo_sim.launch.py")
+        bat_lines = [
+            "@echo off",
+            f'call "{activate_bat}" ros_env',
+            "set ROS_DOMAIN_ID=0",
+            "set RMW_IMPLEMENTATION=rmw_cyclonedds_cpp",
+            f'ros2 launch "{launch_file}"',
+        ]
+        import tempfile as _tempfile
+        bat_path = os.path.join(_tempfile.gettempdir(), "_gazebo_launch.bat")
+        with open(bat_path, "wb") as _bf:
+            _bf.write(("\r\n".join(bat_lines) + "\r\n").encode("ascii"))
 
-        # DDS — simulation is localhost-only, no peer config needed
-        env["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
-        env["ROS_DOMAIN_ID"] = env.get("ROS_DOMAIN_ID", "0")
-
-        # Gazebo Classic environment variables (Windows paths under Library)
-        gazebo_share = os.path.join(conda_prefix, "Library", "share", "gazebo-11")
-        gazebo_models = os.path.join(gazebo_share, "models")
-        env["GAZEBO_MODEL_PATH"] = gazebo_models + ";" + env.get("GAZEBO_MODEL_PATH", "")
-        env["GAZEBO_RESOURCE_PATH"] = gazebo_share + ";" + env.get("GAZEBO_RESOURCE_PATH", "")
-        env["GAZEBO_PLUGIN_PATH"] = conda_lib_bin + ";" + env.get("GAZEBO_PLUGIN_PATH", "")
-
-        env["GAZEBO_MASTER_URI"] = "http://localhost:11345"
-        env["GAZEBO_MODEL_DATABASE_URI"] = ""
-
-        # Build command — try Scripts first, fall back to Library\bin
-        launch_file = os.path.join(_PKG_DIR, "launch", "gazebo_sim.launch.py")
-        ros2_exe = os.path.join(conda_scripts, "ros2.exe")
-        if not os.path.isfile(ros2_exe):
-            ros2_exe = os.path.join(conda_lib_bin, "ros2.exe")
-        cmd = [ros2_exe, "launch", launch_file]
-
-        self._log("Launching Gazebo simulation...")
-        self._log(f"  conda env: {conda_prefix}")
-        self._log(f"  launch file: {launch_file}")
-
-        gazebo_log = os.path.join(_PKG_DIR, ".gazebo_launch.log")
         try:
-            self._gazebo_log_fh = open(gazebo_log, "w")
+            self._gazebo_log_fh = open(ros_log, "w")
             self._gazebo_process = subprocess.Popen(
-                cmd,
-                env=env,
+                ["cmd.exe", "/c", bat_path],
                 stdout=self._gazebo_log_fh,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-            self._log(f"  Gazebo started (PID {self._gazebo_process.pid}).")
-            self._log(f"  Log file: {gazebo_log}")
-
-            # Show the Simulation Initiation popup
-            self._show_sim_initiation_dialog()
-
-            # Check after 3 seconds if process died immediately
-            from PyQt6.QtCore import QTimer
-            QTimer.singleShot(3000, self._check_gazebo_status)
-        except FileNotFoundError:
-            self._log(
-                "ERROR: ros2.exe not found in ros_env.\n"
-                "  Run: setup_robostack_windows.bat"
-            )
+            self._log(f"  Simulation started (PID {self._gazebo_process.pid}).")
+            self._log(f"  Log file: {ros_log}")
         except Exception as e:
-            self._log(f"ERROR launching Gazebo: {e}")
+            self._log(f"ERROR launching simulation: {e}")
+            return
+
+        # Show the Simulation Initiation popup
+        self._show_sim_initiation_dialog()
+
+        # Check after 8 seconds if the process died immediately
+        QTimer.singleShot(8000, self._check_gazebo_status)
 
     def _show_sim_initiation_dialog(self):
         """Create (or raise) the Simulation Initiation popup."""
@@ -5830,13 +6207,13 @@ class RobotControlApp(QMainWindow):
         self._sim_dialog.activateWindow()
 
     def _check_gazebo_status(self):
-        """Check if Gazebo process died shortly after launch and show errors."""
+        """Check if Gazebo Classic died shortly after launch and show errors."""
         if self._gazebo_process is not None and self._gazebo_process.poll() is not None:
             exit_code = self._gazebo_process.returncode
             self._log(f"WARNING: Gazebo exited with code {exit_code}.")
             log_path = os.path.join(_PKG_DIR, ".gazebo_launch.log")
             if os.path.isfile(log_path):
-                with open(log_path, "r") as f:
+                with open(log_path, "r", errors="replace") as f:
                     tail = f.read()[-1500:]
                 if tail.strip():
                     self._log("--- Gazebo log (last lines) ---")

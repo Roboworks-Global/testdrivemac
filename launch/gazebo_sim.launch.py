@@ -1,60 +1,49 @@
 #!/usr/bin/env python3
-"""Launch Gazebo Classic with the Wheeltec robot for simulation testing."""
+"""ROS2 launch file for simulation mode.
+
+On Windows, Gazebo Classic (gzserver/gzclient) and Gazebo Ignition both
+crash at startup due to DLL compatibility issues (STATUS_ENTRYPOINT_NOT_FOUND)
+under x64 emulation on ARM64.
+
+Instead, this launch file runs a minimal Python 2D simulator (sim_node.py)
+that publishes /odom, /scan, /joint_states, and TF odom→base_link using only
+packages already present in ros_env.  The robot moves in RViz when
+movement.py sends /cmd_vel commands.
+"""
 
 import os
+import sys
+from pathlib import Path
 
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess, TimerAction
+from launch.actions import ExecuteProcess
 from launch_ros.actions import Node
 
-# Resolve paths relative to this file's directory (project root is one level up)
 _PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def generate_launch_description():
     urdf_file = os.path.join(_PKG_DIR, 'mini_mec_robot_gazebo.urdf')
-    world_file = os.path.join(_PKG_DIR, 'worlds', 'simulation.world')
-    sdf_tmp        = '/tmp/wheeltec_robot.sdf'
-    urdf_resolved  = '/tmp/wheeltec_robot_resolved.urdf'
-
     with open(urdf_file, 'r') as f:
         robot_description = f.read()
 
-    # Resolve package://movement_pkg/ → file://<abs-path>/ so mesh files are
-    # found without a colcon install step (works for both RViz and Gazebo).
-    meshes_file_uri = f'file://{_PKG_DIR}/'
-    robot_description = robot_description.replace(
-        'package://movement_pkg/', meshes_file_uri)
+    # Resolve package://movement_pkg/ → absolute file URI (platform-safe)
+    meshes_uri = Path(_PKG_DIR).as_uri() + '/'
+    robot_description = robot_description.replace('package://movement_pkg/', meshes_uri)
 
-    # Write the resolved URDF to a temp file for gz sdf conversion.
-    with open(urdf_resolved, 'w') as f:
-        f.write(robot_description)
-
-    # Gazebo server.
-    # libgazebo_ros_init.so is loaded as a system plugin via -s to initialise
-    # the ROS2 context inside Gazebo.  This is required so that the robot's
-    # model plugins (diff-drive, ray sensor) can publish ROS2 topics after
-    # spawning.
-    #
-    # libgazebo_ros_factory.so is intentionally NOT loaded: adding it as a
-    # second -s flag triggers a boost::mutex crash on macOS (confirmed).
-    # Robot spawning is handled via gz model instead (see spawn_robot below).
-    gzserver = ExecuteProcess(
-        cmd=[
-            'gzserver', world_file,
-            '-s', 'libgazebo_ros_init.so',
-            '--verbose',
-        ],
+    # ── Python 2D simulator ──────────────────────────────────────────────────
+    # Publishes /odom, /scan, /joint_states, TF odom→base_link.
+    # Uses sys.executable so it runs in the same conda Python as ros2 launch.
+    sim_node = ExecuteProcess(
+        cmd=[sys.executable,
+             os.path.join(_PKG_DIR, 'movement_pkg', 'sim_node.py')],
         output='screen',
     )
 
-    # Gazebo client (GUI)
-    gzclient = ExecuteProcess(
-        cmd=['gzclient', '--verbose'],
-        output='screen',
-    )
-
-    # Robot state publisher (broadcasts TFs from URDF)
+    # ── robot_state_publisher ────────────────────────────────────────────────
+    # Reads the URDF and publishes /robot_description and TF for fixed joints
+    # (base_link→laser_link, base_link→camera_link, etc.).
+    # use_sim_time=False: uses wall clock (no /clock source needed).
     robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -62,42 +51,23 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'robot_description': robot_description,
-            'use_sim_time': True,
+            'use_sim_time': False,
         }],
     )
 
-    # Spawn the robot using Gazebo's own transport layer (gz model), which does
-    # not require the /spawn_entity ROS2 service.
-    #
-    # Step 1 — gz sdf converts the URDF to SDF format and writes it to a temp
-    #           file (gz model only accepts SDF, not URDF).
-    # Step 2 — gz model inserts the SDF model into the running world.
-    #
-    # Once spawned, the robot's model plugins find the ROS2 context that
-    # libgazebo_ros_init.so already established, so /cmd_vel and /scan appear
-    # as normal ROS2 topics.
-    #
-    # The 6-second delay gives gzserver time to finish loading the world before
-    # the spawn command is sent.
-    spawn_robot = TimerAction(
-        period=6.0,
-        actions=[
-            ExecuteProcess(
-                cmd=[
-                    'bash', '-c',
-                    f'gz sdf -p {urdf_resolved} > {sdf_tmp} && '
-                    f'gz model --spawn-file {sdf_tmp} '
-                    f'--model-name wheeltec_robot '
-                    f'--pose "0 0 0.08 0 0 0"'
-                ],
-                output='screen',
-            )
-        ]
+    # ── Static TF: odom → odom_combined ─────────────────────────────────────
+    # RViz fixed frame is "odom_combined" (the EKF frame used on the real
+    # robot).  In simulation there is no EKF, so publish an identity static
+    # transform.  sim_node provides the dynamic odom→base_link transform.
+    static_odom_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        arguments=['0', '0', '0', '0', '0', '0', 'odom', 'odom_combined'],
+        output='screen',
     )
 
     return LaunchDescription([
-        gzserver,
-        gzclient,
+        sim_node,
         robot_state_publisher,
-        spawn_robot,
+        static_odom_tf,
     ])
