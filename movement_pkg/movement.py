@@ -139,6 +139,7 @@ class Movement(Node):
             return
 
         # user control_loop logic below
+        self.move(self.forward_speed)  # drive forward
         if self.obstacle_in_front():
             self.stop()
             self.turn_cw(self.turn_cw_deg)  # turn CW
