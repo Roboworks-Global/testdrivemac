@@ -2196,7 +2196,7 @@ class GitPushDialog(QDialog):
         pat_row.addWidget(pat_help)
 
         self._branch = QComboBox()
-        self._branch.addItems(["main", "windows", "roboapps"])
+        self._branch.addItems(["main", "mac", "windows", "roboapps"])
         saved_branch = creds.get("branch", "main")
         idx = self._branch.findText(saved_branch)
         self._branch.setCurrentIndex(idx if idx >= 0 else 0)
@@ -2265,7 +2265,7 @@ class GitPullDialog(QDialog):
         form.setSpacing(10)
 
         self._branch = QComboBox()
-        self._branch.addItems(["main", "windows", "roboapps"])
+        self._branch.addItems(["main", "mac", "windows", "roboapps"])
         saved_branch = creds.get("branch", "main")
         idx = self._branch.findText(saved_branch)
         self._branch.setCurrentIndex(idx if idx >= 0 else 0)
